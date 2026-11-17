@@ -25,20 +25,20 @@ AI coding agents routinely burn tens of thousands of tokens reading entire sourc
 
 ```mermaid
 flowchart TD
-    Agent["AI Coding Agent (Antigravity CLI `agy` / Claude Code)"]
-    MCP["`lee serve` (JSON-RPC 2.0 over stdio)"]
+    Agent["AI Coding Agent (Antigravity CLI agy / Claude Code)"]
+    MCP["lee serve (JSON-RPC 2.0 over stdio)"]
     Sec["Security Guard\n(Canonical Path Confinement + Secret Deny-List)"]
 
     subgraph Pillars["Four Pillars of Token Savings"]
         Indexer["Pillar 1: AST, Config & Markdown Indexer\n(tree-sitter + .md Fence State-Machine + blake3)"]
-        DocSearch["Pillar 2: Hybrid Doc & External Source Search\n(Workspace + External `sources` Code & .md)"]
+        DocSearch["Pillar 2: Hybrid Doc & External Source Search\n(Workspace + External sources Code & .md)"]
         Digest["Pillar 3: Command & Diff Digest Engine\n(Cargo / Vitest / Jest / TSC / Pytest / Go / Diff)"]
-        Memory["Pillar 4: Two-Layer Hybrid Memory\n(Project `.lee/.notes/` + Global `~/.config/lee/vault/`)"]
+        Memory["Pillar 4: Two-Layer Hybrid Memory\n(Project .lee/.notes/ + Global ~/.config/lee/vault/)"]
     end
 
     subgraph Storage["Local Offline Storage & ONNX Engine (CUDA / CPU)"]
-        DB[("SQLite WAL (`lee.db` & `global.db`)\nfile_hashes | symbols | doc_sections_fts\nhandles | memories_fts | token_metrics")]
-        BGE["FastEmbed ONNX (CUDA / CPU)\n`BAAI/bge-small-en-v1.5` Quantized (384-dim)"]
+        DB[("SQLite WAL (lee.db & global.db)\nfile_hashes | symbols | doc_sections_fts\nhandles | memories_fts | token_metrics")]
+        BGE["FastEmbed ONNX (CUDA / CPU)\nBAAI/bge-small-en-v1.5 Quantized (384-dim)"]
     end
 
     Agent <-->|"9 MCP Tools + MCP Instructions"| MCP
