@@ -150,10 +150,10 @@ pub fn index_workspace(
         let index_key = to_index_path(&paths.project_root, file_path);
         seen_keys.insert(index_key.clone());
         let raw_hash = blake3::hash(raw_content.as_bytes()).to_hex().to_string();
-        let new_hash = if IndexedFileType::classify(file_path) == Some(IndexedFileType::Markdown) {
-            format!("{raw_hash}:md2")
-        } else {
-            raw_hash
+        let new_hash = match IndexedFileType::classify(file_path) {
+            Some(IndexedFileType::Markdown) => format!("{raw_hash}:md2"),
+            Some(IndexedFileType::Code(_)) => format!("{raw_hash}:r1"),
+            _ => raw_hash,
         };
 
         let existing_hash: Option<String> = tx
@@ -326,6 +326,20 @@ fn upsert_parsed_file(
         )?;
     }
 
+    for r in &parsed.symbol_refs {
+        conn.execute(
+            "INSERT INTO symbol_refs (symbol_name, file_path, caller_symbol, line_number, ref_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                r.symbol_name,
+                index_key,
+                r.caller_symbol,
+                r.line_number as i64,
+                r.ref_kind,
+            ],
+        )?;
+    }
+
     for sec in &parsed.doc_sections {
         conn.execute(
             "INSERT INTO doc_sections_meta (file_path, heading, start_line, end_line, content, embedding)
@@ -371,10 +385,10 @@ pub fn ensure_single_file_indexed(
     let raw_bytes = raw_content.len();
     let index_key = to_index_path(&paths.project_root, &resolved);
     let raw_hash = blake3::hash(raw_content.as_bytes()).to_hex().to_string();
-    let new_hash = if IndexedFileType::classify(&resolved) == Some(IndexedFileType::Markdown) {
-        format!("{raw_hash}:md2")
-    } else {
-        raw_hash
+    let new_hash = match IndexedFileType::classify(&resolved) {
+        Some(IndexedFileType::Markdown) => format!("{raw_hash}:md2"),
+        Some(IndexedFileType::Code(_)) => format!("{raw_hash}:r1"),
+        _ => raw_hash,
     };
 
     let existing_hash: Option<String> = conn
@@ -1319,3 +1333,74 @@ pub fn smart_grep_search(
     let raw_bytes = total_matched_file_bytes.max(out.len());
     Ok((out, raw_bytes))
 }
+
+/// Finds all AST references (`call`, `type_use`, `import`) to `symbol` across the workspace.
+pub fn find_symbol_references(
+    conn: &mut Connection,
+    paths: &AppPaths,
+    symbol: &str,
+) -> Result<(String, usize)> {
+    let clean = symbol.trim();
+    if clean.is_empty() {
+        bail!("Provide a non-empty `symbol` to `find_references`");
+    }
+
+    let stats = index_workspace(conn, paths, None)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT r.file_path, r.line_number, r.caller_symbol, r.ref_kind, COALESCE(f.line_count, 50)
+         FROM symbol_refs r
+         LEFT JOIN file_hashes f ON r.file_path = f.file_path
+         WHERE r.symbol_name = ?1
+         ORDER BY
+           CASE WHEN r.file_path LIKE '/%' THEN 1 ELSE 0 END ASC,
+           CASE WHEN r.ref_kind = 'import' THEN 0 ELSE 1 END ASC,
+           r.file_path ASC,
+           r.line_number ASC",
+    )?;
+
+    let rows: Vec<(String, i64, Option<String>, String, i64)> = stmt
+        .query_map(params![clean], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        let msg = format!("No references found for symbol '{clean}'.");
+        return Ok((msg.clone(), stats.total_raw_bytes.max(msg.len())));
+    }
+
+    let mut seen_files = HashSet::new();
+    let mut raw_bytes = 0usize;
+    let mut out = format!("{clean} dipakai di {} lokasi:\n", rows.len());
+
+    for (fp, line, caller, kind, line_cnt) in &rows {
+        if seen_files.insert(fp.clone()) {
+            raw_bytes += (*line_cnt as usize).saturating_mul(45);
+        }
+        match (kind.as_str(), caller.as_deref()) {
+            ("import", None) => {
+                out.push_str(&format!("- {fp}:{line} [import]\n"));
+            }
+            ("import", Some(c)) => {
+                out.push_str(&format!("- {fp}:{line} [in fn {c}] [import]\n"));
+            }
+            (_, Some(c)) => {
+                out.push_str(&format!("- {fp}:{line} [in fn {c}] ({kind})\n"));
+            }
+            (_, None) => {
+                out.push_str(&format!("- {fp}:{line} ({kind})\n"));
+            }
+        }
+    }
+
+    Ok((out.clone(), raw_bytes.max(out.len())))
+}
+

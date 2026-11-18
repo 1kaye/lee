@@ -1,5 +1,7 @@
-use crate::indexer::languages::{extract_code_symbols, CodeLanguage};
-use crate::indexer::markdown::{parse_markdown, DocSectionChunk, ExtractedSymbol};
+use crate::indexer::languages::{extract_code_symbols_and_refs, CodeLanguage};
+use crate::indexer::markdown::{
+    parse_markdown, DocSectionChunk, ExtractedSymbol, ExtractedSymbolRef,
+};
 use anyhow::Result;
 use std::path::Path;
 
@@ -52,6 +54,7 @@ pub struct ParsedFileResult {
     pub file_type: IndexedFileType,
     pub line_count: usize,
     pub symbols: Vec<ExtractedSymbol>,
+    pub symbol_refs: Vec<ExtractedSymbolRef>,
     pub doc_sections: Vec<DocSectionChunk>,
 }
 
@@ -63,11 +66,12 @@ pub fn parse_file_content(path: &Path, source: &str) -> Result<Option<ParsedFile
 
     match ft {
         IndexedFileType::Code(lang) => {
-            let symbols = extract_code_symbols(lang, source)?;
+            let (symbols, symbol_refs) = extract_code_symbols_and_refs(lang, source)?;
             Ok(Some(ParsedFileResult {
                 file_type: ft,
                 line_count,
                 symbols,
+                symbol_refs,
                 doc_sections: Vec::new(),
             }))
         }
@@ -77,6 +81,7 @@ pub fn parse_file_content(path: &Path, source: &str) -> Result<Option<ParsedFile
                 file_type: ft,
                 line_count,
                 symbols: parsed.symbols,
+                symbol_refs: Vec::new(),
                 doc_sections: parsed.sections,
             }))
         }
@@ -86,6 +91,7 @@ pub fn parse_file_content(path: &Path, source: &str) -> Result<Option<ParsedFile
                 file_type: ft,
                 line_count,
                 symbols,
+                symbol_refs: Vec::new(),
                 doc_sections: Vec::new(),
             }))
         }

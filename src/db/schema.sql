@@ -110,3 +110,17 @@ CREATE TABLE IF NOT EXISTS token_metrics (
     sent_bytes INTEGER NOT NULL, -- Compact summary/slice size actually sent to the AI
     saved_bytes INTEGER NOT NULL -- Saved byte difference (1 token ~= 4 bytes)
 );
+
+-- 9. Cross-File Symbol Reference & Call Graph Index
+CREATE TABLE IF NOT EXISTS symbol_refs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    caller_symbol TEXT,
+    line_number INTEGER NOT NULL,
+    ref_kind TEXT NOT NULL,      -- 'call', 'type_use', 'import'
+    FOREIGN KEY (file_path) REFERENCES file_hashes(file_path) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_symbol_refs_name ON symbol_refs(symbol_name);
+CREATE INDEX IF NOT EXISTS idx_symbol_refs_file ON symbol_refs(file_path);
+

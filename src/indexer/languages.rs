@@ -1,5 +1,6 @@
-use crate::indexer::markdown::ExtractedSymbol;
+use crate::indexer::markdown::{ExtractedSymbol, ExtractedSymbolRef};
 use anyhow::{bail, Result};
+use std::collections::HashSet;
 use std::path::Path;
 use tree_sitter::{Language, Node, Parser};
 
@@ -42,8 +43,16 @@ impl CodeLanguage {
 }
 
 pub fn extract_code_symbols(lang: CodeLanguage, source: &str) -> Result<Vec<ExtractedSymbol>> {
+    let (syms, _) = extract_code_symbols_and_refs(lang, source)?;
+    Ok(syms)
+}
+
+pub fn extract_code_symbols_and_refs(
+    lang: CodeLanguage,
+    source: &str,
+) -> Result<(Vec<ExtractedSymbol>, Vec<ExtractedSymbolRef>)> {
     if lang == CodeLanguage::Svelte {
-        return extract_svelte_symbols(source);
+        return extract_svelte_symbols_and_refs(source);
     }
     parse_with_offset(lang, source, 0)
 }
@@ -52,7 +61,7 @@ fn parse_with_offset(
     lang: CodeLanguage,
     source: &str,
     line_offset: usize,
-) -> Result<Vec<ExtractedSymbol>> {
+) -> Result<(Vec<ExtractedSymbol>, Vec<ExtractedSymbolRef>)> {
     let mut parser = Parser::new();
     parser
         .set_language(&lang.ts_language())
@@ -64,12 +73,27 @@ fn parse_with_offset(
 
     let lines: Vec<&str> = source.lines().collect();
     let mut out = Vec::new();
-    walk_node(lang, tree.root_node(), source.as_bytes(), &lines, line_offset, None, &mut out);
-    Ok(out)
+    let mut refs_out = Vec::new();
+    walk_node(
+        lang,
+        tree.root_node(),
+        source.as_bytes(),
+        &lines,
+        line_offset,
+        None,
+        None,
+        &mut out,
+        &mut refs_out,
+    );
+    dedup_refs(&mut refs_out);
+    Ok((out, refs_out))
 }
 
-fn extract_svelte_symbols(source: &str) -> Result<Vec<ExtractedSymbol>> {
+fn extract_svelte_symbols_and_refs(
+    source: &str,
+) -> Result<(Vec<ExtractedSymbol>, Vec<ExtractedSymbolRef>)> {
     let mut symbols = Vec::new();
+    let mut refs = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
     let mut idx = 0;
 
@@ -85,10 +109,11 @@ fn extract_svelte_symbols(source: &str) -> Result<Vec<ExtractedSymbol>> {
                 if let Some(close_rel) = first_line_rest.find("</script>") {
                     block_lines.push(&first_line_rest[..close_rel]);
                     let block_src = block_lines.join("\n");
-                    if let Ok(mut syms) =
+                    if let Ok((mut syms, mut rfs)) =
                         parse_with_offset(CodeLanguage::TypeScript, &block_src, script_start_line)
                     {
                         symbols.append(&mut syms);
+                        refs.append(&mut rfs);
                     }
                     idx += 1;
                     continue;
@@ -104,10 +129,11 @@ fn extract_svelte_symbols(source: &str) -> Result<Vec<ExtractedSymbol>> {
                         idx += 1;
                     }
                     let block_src = block_lines.join("\n");
-                    if let Ok(mut syms) =
+                    if let Ok((mut syms, mut rfs)) =
                         parse_with_offset(CodeLanguage::TypeScript, &block_src, script_start_line)
                     {
                         symbols.append(&mut syms);
+                        refs.append(&mut rfs);
                     }
                 }
             }
@@ -115,9 +141,16 @@ fn extract_svelte_symbols(source: &str) -> Result<Vec<ExtractedSymbol>> {
         idx += 1;
     }
 
-    Ok(symbols)
+    dedup_refs(&mut refs);
+    Ok((symbols, refs))
 }
 
+fn dedup_refs(refs: &mut Vec<ExtractedSymbolRef>) {
+    let mut seen = HashSet::with_capacity(refs.len());
+    refs.retain(|r| seen.insert((r.symbol_name.clone(), r.line_number)));
+}
+
+#[allow(clippy::too_many_arguments)]
 fn walk_node(
     lang: CodeLanguage,
     node: Node,
@@ -125,13 +158,22 @@ fn walk_node(
     lines: &[&str],
     line_offset: usize,
     parent_name: Option<&str>,
+    caller_fn: Option<&str>,
     out: &mut Vec<ExtractedSymbol>,
+    refs_out: &mut Vec<ExtractedSymbolRef>,
 ) {
     let kind = node.kind();
     let mut next_parent: Option<String> = parent_name.map(|s| s.to_string());
+    let mut next_caller: Option<String> = caller_fn.map(|s| s.to_string());
+    let line_number = node.start_position().row + 1 + line_offset;
 
     match lang {
         CodeLanguage::Rust => {
+            if kind == "use_declaration" {
+                extract_rust_use_refs(node, source_bytes, line_offset, caller_fn, refs_out);
+                return;
+            }
+
             let mapped_kind = match kind {
                 "struct_item" => Some("struct"),
                 "enum_item" => Some("enum"),
@@ -158,18 +200,83 @@ fn walk_node(
                     let sym = build_symbol(node, lines, line_offset, name.clone(), sym_kind, parent_name);
                     out.push(sym);
                     if matches!(sym_kind, "impl" | "trait" | "mod" | "struct") {
-                        next_parent = Some(name);
+                        next_parent = Some(name.clone());
+                    }
+                    if sym_kind == "fn" {
+                        next_caller = Some(name);
                     }
                 }
             }
+
+            match kind {
+                "call_expression" => {
+                    if let Some(raw_fn) = node.child_by_field_name("function") {
+                        let fn_node = if raw_fn.kind() == "generic_function" {
+                            raw_fn.child_by_field_name("function").unwrap_or(raw_fn)
+                        } else {
+                            raw_fn
+                        };
+                        match fn_node.kind() {
+                            "identifier" => {
+                                if let Ok(txt) = fn_node.utf8_text(source_bytes) {
+                                    push_ref(refs_out, txt.trim(), caller_fn, line_number, "call");
+                                }
+                            }
+                            "field_expression" => {
+                                if let Some(f) = node_field_text(fn_node, "field", source_bytes) {
+                                    push_ref(refs_out, &f, caller_fn, line_number, "call");
+                                }
+                            }
+                            "scoped_identifier" => {
+                                if let Some(path_node) = fn_node.child_by_field_name("path") {
+                                    if let Some(type_or_mod) = terminal_identifier(path_node, source_bytes) {
+                                        if is_upper_ident(&type_or_mod) {
+                                            push_ref(refs_out, &type_or_mod, caller_fn, line_number, "call");
+                                        }
+                                    }
+                                }
+                                if let Some(nm) = node_field_text(fn_node, "name", source_bytes) {
+                                    push_ref(refs_out, &nm, caller_fn, line_number, "call");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "type_identifier" => {
+                    if !is_type_declaration_name(node) {
+                        if let Ok(txt) = node.utf8_text(source_bytes) {
+                            push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
+                        }
+                    }
+                }
+                "scoped_identifier" => {
+                    let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
+                    if !matches!(parent_kind, "call_expression" | "generic_function" | "scoped_identifier") {
+                        if let Some(path_node) = node.child_by_field_name("path") {
+                            if let Some(type_name) = terminal_identifier(path_node, source_bytes) {
+                                if is_upper_ident(&type_name) {
+                                    push_ref(refs_out, &type_name, caller_fn, line_number, "type_use");
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         CodeLanguage::TypeScript | CodeLanguage::Tsx | CodeLanguage::JavaScript | CodeLanguage::Svelte => {
+            if kind == "import_statement" {
+                extract_ts_import_refs(node, source_bytes, line_offset, caller_fn, refs_out);
+                return;
+            }
             match kind {
                 "function_declaration" | "method_definition" => {
                     let name = node_field_text(node, "name", source_bytes)
                         .unwrap_or_else(|| first_identifier_child(node, source_bytes));
                     if !name.is_empty() {
-                        out.push(build_symbol(node, lines, line_offset, name, "fn", parent_name));
+                        out.push(build_symbol(node, lines, line_offset, name.clone(), "fn", parent_name));
+                        next_caller = Some(name);
                     }
                 }
                 "class_declaration" => {
@@ -210,7 +317,6 @@ fn walk_node(
                     }
                 }
                 "lexical_declaration" | "variable_declaration" => {
-                    // Check if any variable_declarator child contains an arrow_function
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
                         if child.kind() == "variable_declarator" {
@@ -226,12 +332,38 @@ fn walk_node(
                                         node,
                                         lines,
                                         line_offset,
-                                        name,
+                                        name.clone(),
                                         "fn",
                                         parent_name,
                                     ));
+                                    next_caller = Some(name);
                                 }
                             }
+                        }
+                    }
+                }
+                "call_expression" | "new_expression" => {
+                    let field = if kind == "new_expression" { "constructor" } else { "function" };
+                    if let Some(fn_node) = node.child_by_field_name(field) {
+                        match fn_node.kind() {
+                            "identifier" => {
+                                if let Ok(txt) = fn_node.utf8_text(source_bytes) {
+                                    push_ref(refs_out, txt.trim(), caller_fn, line_number, "call");
+                                }
+                            }
+                            "member_expression" => {
+                                if let Some(prop) = node_field_text(fn_node, "property", source_bytes) {
+                                    push_ref(refs_out, &prop, caller_fn, line_number, "call");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "type_identifier" => {
+                    if !is_type_declaration_name(node) {
+                        if let Ok(txt) = node.utf8_text(source_bytes) {
+                            push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
                         }
                     }
                 }
@@ -239,11 +371,24 @@ fn walk_node(
             }
         }
         CodeLanguage::Python => match kind {
+            "import_from_statement" => {
+                let mod_id = node.child_by_field_name("module_name").map(|n| n.id());
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if Some(child.id()) != mod_id && (child.kind() == "dotted_name" || child.kind() == "aliased_import") {
+                        if let Some(ident) = terminal_identifier(child, source_bytes) {
+                            push_ref(refs_out, &ident, caller_fn, line_number, "import");
+                        }
+                    }
+                }
+                return;
+            }
             "function_definition" => {
                 let name = node_field_text(node, "name", source_bytes)
                     .unwrap_or_else(|| first_identifier_child(node, source_bytes));
                 if !name.is_empty() {
-                    out.push(build_symbol(node, lines, line_offset, name, "fn", parent_name));
+                    out.push(build_symbol(node, lines, line_offset, name.clone(), "fn", parent_name));
+                    next_caller = Some(name);
                 }
             }
             "class_definition" => {
@@ -254,6 +399,23 @@ fn walk_node(
                     next_parent = Some(name);
                 }
             }
+            "call" => {
+                if let Some(fn_node) = node.child_by_field_name("function") {
+                    match fn_node.kind() {
+                        "identifier" => {
+                            if let Ok(txt) = fn_node.utf8_text(source_bytes) {
+                                push_ref(refs_out, txt.trim(), caller_fn, line_number, "call");
+                            }
+                        }
+                        "attribute" => {
+                            if let Some(attr) = node_field_text(fn_node, "attribute", source_bytes) {
+                                push_ref(refs_out, &attr, caller_fn, line_number, "call");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         },
         CodeLanguage::Go => match kind {
@@ -261,7 +423,8 @@ fn walk_node(
                 let name = node_field_text(node, "name", source_bytes)
                     .unwrap_or_else(|| first_identifier_child(node, source_bytes));
                 if !name.is_empty() {
-                    out.push(build_symbol(node, lines, line_offset, name, "fn", parent_name));
+                    out.push(build_symbol(node, lines, line_offset, name.clone(), "fn", parent_name));
+                    next_caller = Some(name);
                 }
             }
             "type_declaration" => {
@@ -292,6 +455,30 @@ fn walk_node(
                     }
                 }
             }
+            "call_expression" => {
+                if let Some(fn_node) = node.child_by_field_name("function") {
+                    match fn_node.kind() {
+                        "identifier" => {
+                            if let Ok(txt) = fn_node.utf8_text(source_bytes) {
+                                push_ref(refs_out, txt.trim(), caller_fn, line_number, "call");
+                            }
+                        }
+                        "selector_expression" => {
+                            if let Some(fld) = node_field_text(fn_node, "field", source_bytes) {
+                                push_ref(refs_out, &fld, caller_fn, line_number, "call");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "type_identifier" => {
+                if !is_type_declaration_name(node) {
+                    if let Ok(txt) = node.utf8_text(source_bytes) {
+                        push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
+                    }
+                }
+            }
             _ => {}
         },
     }
@@ -305,8 +492,149 @@ fn walk_node(
             lines,
             line_offset,
             next_parent.as_deref(),
+            next_caller.as_deref(),
             out,
+            refs_out,
         );
+    }
+}
+
+fn push_ref(
+    refs_out: &mut Vec<ExtractedSymbolRef>,
+    symbol_name: &str,
+    caller_fn: Option<&str>,
+    line_number: usize,
+    ref_kind: &str,
+) {
+    if symbol_name.is_empty()
+        || matches!(symbol_name, "self" | "Self" | "crate" | "super" | "_")
+    {
+        return;
+    }
+    refs_out.push(ExtractedSymbolRef {
+        symbol_name: symbol_name.to_string(),
+        caller_symbol: caller_fn.map(|s| s.to_string()),
+        line_number,
+        ref_kind: ref_kind.to_string(),
+    });
+}
+
+fn is_upper_ident(s: &str) -> bool {
+    s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) && s != "Self"
+}
+
+fn is_type_declaration_name(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let pk = parent.kind();
+    if matches!(
+        pk,
+        "type_parameters" | "type_parameter" | "constrained_type_parameter"
+    ) {
+        return true;
+    }
+    if matches!(
+        pk,
+        "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "type_item"
+            | "class_declaration"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "enum_declaration"
+            | "type_spec"
+            | "type_alias"
+    ) {
+        if let Some(name_node) = parent.child_by_field_name("name") {
+            if name_node.id() == node.id() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn terminal_identifier(node: Node, source_bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "field_identifier" => node
+            .utf8_text(source_bytes)
+            .ok()
+            .map(|s| s.trim().to_string()),
+        "scoped_identifier" | "scoped_type_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|n| terminal_identifier(n, source_bytes)),
+        _ => {
+            let mut last = None;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(id) = terminal_identifier(child, source_bytes) {
+                    last = Some(id);
+                }
+            }
+            last
+        }
+    }
+}
+
+fn extract_rust_use_refs(
+    node: Node,
+    source_bytes: &[u8],
+    line_offset: usize,
+    caller_fn: Option<&str>,
+    refs_out: &mut Vec<ExtractedSymbolRef>,
+) {
+    let line_number = node.start_position().row + 1 + line_offset;
+    match node.kind() {
+        "scoped_identifier" => {
+            if let Some(name) = node_field_text(node, "name", source_bytes) {
+                push_ref(refs_out, &name, caller_fn, line_number, "import");
+            }
+        }
+        "scoped_use_list" => {
+            if let Some(list) = node.child_by_field_name("list") {
+                extract_rust_use_refs(list, source_bytes, line_offset, caller_fn, refs_out);
+            }
+        }
+        "use_as_clause" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                extract_rust_use_refs(path, source_bytes, line_offset, caller_fn, refs_out);
+            }
+        }
+        "identifier" | "type_identifier" => {
+            if let Ok(txt) = node.utf8_text(source_bytes) {
+                push_ref(refs_out, txt.trim(), caller_fn, line_number, "import");
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                extract_rust_use_refs(child, source_bytes, line_offset, caller_fn, refs_out);
+            }
+        }
+    }
+}
+
+fn extract_ts_import_refs(
+    node: Node,
+    source_bytes: &[u8],
+    line_offset: usize,
+    caller_fn: Option<&str>,
+    refs_out: &mut Vec<ExtractedSymbolRef>,
+) {
+    let line_number = node.start_position().row + 1 + line_offset;
+    if node.kind() == "identifier" {
+        if let Ok(txt) = node.utf8_text(source_bytes) {
+            push_ref(refs_out, txt.trim(), caller_fn, line_number, "import");
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "string" {
+            extract_ts_import_refs(child, source_bytes, line_offset, caller_fn, refs_out);
+        }
     }
 }
 

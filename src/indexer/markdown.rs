@@ -9,6 +9,14 @@ pub struct ExtractedSymbol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedSymbolRef {
+    pub symbol_name: String,
+    pub caller_symbol: Option<String>,
+    pub line_number: usize,
+    pub ref_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocSectionChunk {
     pub heading: String,
     pub start_line: usize,

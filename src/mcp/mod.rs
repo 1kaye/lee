@@ -170,7 +170,7 @@ mod tests {
             .as_array()
             .unwrap()
             .len();
-        assert_eq!(tools_arr, 9);
+        assert_eq!(tools_arr, 10);
 
         // 2. project_map
         let map_resp = handle_jsonrpc_message(
@@ -249,6 +249,40 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(files_txt.contains("src/lib.rs (1 matches)"));
+
+        // 7. find_references (import, type_use, call)
+        fs::write(
+            temp.join("src/caller.rs"),
+            "use crate::Engine;\npub fn boot(eng: &Engine) -> bool {\n    let _ = Engine::start(eng);\n    eng.start()\n}\n",
+        )
+        .unwrap();
+        let refs_resp = handle_jsonrpc_message(
+            &mut conn,
+            &paths,
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"find_references","arguments":{"symbol":"Engine"}}}"#,
+        )
+        .unwrap();
+        let refs_txt = refs_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(refs_txt.contains("Engine dipakai di"));
+        assert!(refs_txt.contains("src/caller.rs:1 [import]"));
+        assert!(refs_txt.contains("src/caller.rs:2 [in fn boot] (type_use)"));
+        assert!(refs_txt.contains("src/caller.rs:3 [in fn boot] (call)"));
+
+        let fn_refs_resp = handle_jsonrpc_message(
+            &mut conn,
+            &paths,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"find_references","arguments":{"symbol":"start"}}}"#,
+        )
+        .unwrap();
+        let fn_refs_txt = fn_refs_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(fn_refs_txt.contains("src/caller.rs:3 [in fn boot] (call)"));
+        assert!(fn_refs_txt.contains("src/caller.rs:4 [in fn boot] (call)"));
 
         let _ = fs::remove_dir_all(&temp);
     }

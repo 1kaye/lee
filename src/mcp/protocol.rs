@@ -104,6 +104,17 @@ pub fn mcp_tools_list() -> Value {
                 }
             },
             {
+                "name": "find_references",
+                "description": "Find all AST symbol references (call, type_use, import) and enclosing caller functions across the workspace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "Function, struct, enum, trait, or type name to trace." }
+                    },
+                    "required": ["symbol"]
+                }
+            },
+            {
                 "name": "search_docs",
                 "description": "Hybrid FTS5 BM25 + BGE-Small (RRF) search over project & external `sources` .md files.",
                 "inputSchema": {

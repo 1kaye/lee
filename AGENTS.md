@@ -10,11 +10,12 @@ This workspace uses **`lee`**, a local token-saving MCP Server & CLI Toolkit (60
 1. **Cold Start & Onboarding (`project_map` + `recall_memory`):**
    - Call **`project_map()`** first to get prioritized files, AST symbols, `#` headings, and `[start..end]` ranges (pass `subpath="src/"` to expand overflow directories).
    - Call **`recall_memory(query="...")`** to load architectural decisions, UI/code conventions, session `handoff`, and `backlog`. Never read dozens of raw files blindly.
-2. **Precision Code & Config Reading (`outline` + `read_symbol`):**
+2. **Precision Code & Config Reading (`outline` + `read_symbol` + `find_references`):**
    - Call **`outline(file="...")`** to inspect AST symbols, `#` headings, or `.yml`/`.toml`/`.json` keys with `[start_line..end_line]` (`mod tests` collapsed unless `include_tests=true`).
    - Call **`read_symbol(file="...", symbol="...")`** (or `start_line`..`end_line`) to read only the exact slice needed.
    - To **find and read a function/struct without knowing its file**, omit `file`: **`read_symbol(symbol="fn_name")`**.
    - Use **`strip_comments=true`** to remove non-doc comments, **`signatures_only=true`** to keep imports/types/signatures while eliding function bodies via AST spans, and **`max_lines`** for pagination.
+   - Before refactoring a function signature, struct, or enum, call **`find_references(symbol="...")`** to list every AST reference (`call`, `type_use`, `import`) and enclosing caller function across the workspace.
 3. **Reading & Searching `.md` Documentation (`search_docs`):**
    - Never read long `.md` files (local or in external `sources`) in full.
    - Call **`search_docs(query="...")`** for hybrid search (SQLite FTS5 BM25 + offline `BGESmallENV15Q` RRF), or use `outline(file="doc.md")` + `read_symbol(file="doc.md", symbol="Section Heading")`.

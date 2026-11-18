@@ -1,7 +1,9 @@
 use crate::config::AppPaths;
 use crate::db::record_token_metric;
 use crate::digest::{recall_handle, run_command_digest};
-use crate::indexer::{build_outline, build_project_map, read_symbol_range, smart_grep_search};
+use crate::indexer::{
+    build_outline, build_project_map, find_symbol_references, read_symbol_range, smart_grep_search,
+};
 use crate::memory::{recall_memories_hybrid, search_docs_hybrid, store_memory};
 use anyhow::{bail, Result};
 use rusqlite::Connection;
@@ -110,6 +112,12 @@ fn execute_tool(
                 signatures_only,
                 max_lines,
             )
+        }
+        "find_references" => {
+            let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) else {
+                bail!("Missing required parameter `symbol`");
+            };
+            find_symbol_references(conn, paths, symbol)
         }
         "search_docs" => {
             let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
