@@ -210,14 +210,10 @@ pub fn serialize_f32_vec(vec: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// Deserializes SQLite `BLOB` (`&[u8]`) back into `Vec<f32>` using `chunks_exact(4)` and `f32::from_le_bytes`.
+/// Deserializes SQLite `BLOB` (`&[u8]`) back into `Vec<f32>` using `as_chunks::<4>()` and `f32::from_le_bytes`.
 pub fn deserialize_f32_vec(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|chunk| {
-            let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            f32::from_le_bytes(arr)
-        })
-        .collect()
+    let (chunks, _) = blob.as_chunks::<4>();
+    chunks.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 #[cfg(test)]

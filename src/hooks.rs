@@ -73,25 +73,23 @@ pub fn auto_sync_agents_md(paths: &crate::config::AppPaths, latest_rules: &str) 
 
     // 2. Sync ~/.config/lee/AGENTS.md if it exists
     let global_agents = paths.global_dir.join("AGENTS.md");
-    if global_agents.is_file() {
-        if let Ok(curr) = fs::read_to_string(&global_agents) {
-            if curr != normalized && fs::write(&global_agents, normalized).is_ok() {
-                updated_count += 1;
-            }
-        }
+    if global_agents.is_file()
+        && let Ok(curr) = fs::read_to_string(&global_agents)
+        && curr != normalized
+        && fs::write(&global_agents, normalized).is_ok()
+    {
+        updated_count += 1;
     }
 
     // 3. Sync managed <!-- lee:start -->...<!-- lee:end --> blocks in root AGENTS.md & CLAUDE.md
     for fname in ["AGENTS.md", "CLAUDE.md"] {
         let target = paths.project_root.join(fname);
-        if target.is_file() {
-            if let Ok(curr) = fs::read_to_string(&target) {
-                if let Some(patched) = update_managed_block_if_changed(&curr, normalized) {
-                    if fs::write(&target, patched).is_ok() {
-                        updated_count += 1;
-                    }
-                }
-            }
+        if target.is_file()
+            && let Ok(curr) = fs::read_to_string(&target)
+            && let Some(patched) = update_managed_block_if_changed(&curr, normalized)
+            && fs::write(&target, patched).is_ok()
+        {
+            updated_count += 1;
         }
     }
 
@@ -102,12 +100,12 @@ pub fn auto_sync_agents_md(paths: &crate::config::AppPaths, latest_rules: &str) 
     }
     for pdir in plugin_dirs {
         let rules_file = pdir.join("rules/AGENTS.md");
-        if rules_file.is_file() {
-            if let Ok(curr) = fs::read_to_string(&rules_file) {
-                if curr != normalized && fs::write(&rules_file, normalized).is_ok() {
-                    updated_count += 1;
-                }
-            }
+        if rules_file.is_file()
+            && let Ok(curr) = fs::read_to_string(&rules_file)
+            && curr != normalized
+            && fs::write(&rules_file, normalized).is_ok()
+        {
+            updated_count += 1;
         }
     }
 
@@ -141,6 +139,9 @@ pub fn rewrite_shell_command_for_hook(cmd: &str) -> Option<String> {
         "git log",
         "git diff",
         "kaye diff",
+        "kaye wc",
+        "kaye what change",
+        "kaye w c",
         "kaye status",
         "npm test",
         "pnpm test",
@@ -359,6 +360,8 @@ pub fn discover_missed_savings(custom_path: Option<&Path>) -> Result<String> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if !path_str.is_empty()
+                        && !path_str.contains("/.gemini/")
+                        && !path_str.contains("/.claude/")
                         && (path_str.ends_with(".rs")
                             || path_str.ends_with(".ts")
                             || path_str.ends_with(".py")

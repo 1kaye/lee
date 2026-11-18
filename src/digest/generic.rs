@@ -15,8 +15,12 @@ pub fn is_diff_command(cmd: &str, raw: &str) -> bool {
     c.contains("diff")
         || c.contains("what change")
         || c.contains("w c")
+        || c == "kaye wc"
+        || c.starts_with("kaye wc ")
         || raw.contains("\ndiff --git ")
         || raw.starts_with("diff --git ")
+        || raw.contains("\n  [MODIFIED] ")
+        || raw.contains("\n  [NEW] ")
 }
 
 pub fn is_git_status_or_log_command(cmd: &str) -> bool {
@@ -93,7 +97,21 @@ pub fn parse_git_status_or_log_output(cmd: &str, raw: &str, exit_code: Option<i3
     }
 }
 
-/// Parses unified diff output (`kaye diff`, `kaye what change`, `git diff`, `gh pr diff`)
+/// Extracts the file path from a `kaye wc` header line like `  [MODIFIED] src/main.rs`.
+pub fn parse_kaye_wc_file_header(line: &str) -> Option<&str> {
+    let t = line.trim();
+    for badge in ["[MODIFIED] ", "[NEW] ", "[DELETED] ", "[RENAMED] "] {
+        if let Some(rest) = t.strip_prefix(badge) {
+            let path = rest.trim();
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Parses unified diff output (`kaye diff`, `kaye what change`, `kaye wc`, `git diff`, `gh pr diff`)
 /// into a per-file summary with `+added/-removed` counts and line ranges.
 pub fn parse_diff_output(raw: &str, exit_code: Option<i32>) -> ParsedDigest {
     let lines: Vec<&str> = raw.lines().collect();
@@ -124,10 +142,19 @@ pub fn parse_diff_output(raw: &str, exit_code: Option<i32>) -> ParsedDigest {
                 .trim_start_matches("b/")
                 .to_string();
             current_file = Some((file_name, ln, 0, 0));
+        } else if let Some(kaye_path) = parse_kaye_wc_file_header(line) {
+            if let Some((f, st, add, rem)) = current_file.take() {
+                summary_lines.push(format!(
+                    "- {f} [L{st}..{}] (+{add} / -{rem}) -> recall with `item=\"{f}\"`",
+                    ln.saturating_sub(1)
+                ));
+            }
+            current_file = Some((kaye_path.to_string(), ln, 0, 0));
         } else if let Some((_, _, ref mut add, ref mut rem)) = current_file {
-            if line.starts_with('+') && !line.starts_with("+++") {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
                 *add += 1;
-            } else if line.starts_with('-') && !line.starts_with("---") {
+            } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
                 *rem += 1;
             }
         }

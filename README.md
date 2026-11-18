@@ -37,11 +37,11 @@ flowchart TD
     end
 
     subgraph Storage["Local Offline Storage & ONNX Engine (CUDA / CPU)"]
-        DB[("SQLite WAL (lee.db & global.db)\nfile_hashes | symbols | doc_sections_fts\nhandles | memories_fts | token_metrics")]
+        DB[("SQLite WAL (lee.db & global.db)\nfile_hashes | symbols | symbol_refs | doc_sections_fts\nhandles | memories_fts | token_metrics")]
         BGE["FastEmbed ONNX (CUDA / CPU)\nBAAI/bge-small-en-v1.5 Quantized (384-dim)"]
     end
 
-    Agent <-->|"9 MCP Tools + MCP Instructions"| MCP
+    Agent <-->|"10 MCP Tools + MCP Instructions"| MCP
     MCP --> Sec
     Sec --> Indexer
     Sec --> DocSearch
@@ -64,6 +64,7 @@ flowchart TD
 | :--- | :--- | :--- | :--- |
 | **Cold Start / Codebase Onboarding** | Reading 10–20 raw source & README files (~18,000 tokens) | `project_map` + `recall_memory` (~750 tokens) | **~95%** |
 | **Reading a Specific Function / Struct** | Reading an entire 600-line file (~4,500 tokens) | `outline` + `read_symbol` for lines `[42..88]` (~380 tokens) | **~91%** |
+| **Refactoring / Tracing Callers & Type Deps** | `grep` + opening multiple files to check caller context (~5,000 tokens) | `find_references(symbol="...")` via AST `symbol_refs` (~180 tokens) | **~96%** |
 | **Searching Large `.md` Documentation** | Reading a 1,200-line guide in full (~9,000 tokens) | `search_docs(query="...", budget_tokens=800)` (~600 tokens) | **~93%** |
 | **Cross-Project Pattern Search** | Raw `grep` + opening files to check enclosing functions (~3,200 tokens) | `smart_grep` grouped by file with `[in fn ... (A..B)]` (~450 tokens) | **~85%** |
 | **Running `cargo test` / `vitest` / `kaye diff`** | 1,500 lines of compiler/test/diff output (~12,000 tokens) | `run_digest` stores `h:8f2a9c` + `recall(item="...")` (~350 tokens) | **~97%** |
@@ -134,21 +135,22 @@ Add to `.mcp.json` in your project root or `~/.claude.json`:
 
 ---
 
-## 5. Complete Reference: 9 MCP Tools & CLI Commands
+## 5. Complete Reference: 10 MCP Tools & CLI Commands
 
-### 9 MCP Tools
+### 10 MCP Tools
 
 | # | Tool Name | Key Parameters | Purpose |
 | :-: | :--- | :--- | :--- |
 | 1 | `project_map` | `subpath?`, `max_tokens?` (def: `800`) | Parallel codebase & Markdown scan returning prioritized directory trees, AST symbols, `#` headings, and `[start..end]` ranges. |
 | 2 | `outline` | `file`, `max_tokens?`, `include_tests?` | Complete symbol table (code), `#` Heading TOC (`.md`), or config key ranges (`.yml`/`.toml`/`.json`) for one file. |
 | 3 | `read_symbol` | `file?`, `symbol?`, `start_line?`, `end_line?`, `context_lines?`, `strip_comments?`, `signatures_only?`, `max_lines?` | Precision line-range reader for symbols (across workspace if `file` omitted), Markdown sections, or config keys with pagination, comment stripping, & AST `signatures_only` mode. |
-| 4 | `search_docs` | `query`, `file_filter?`, `budget_tokens?` (def: `800`) | Hybrid search (FTS5 BM25 + `BGESmallENV15Q` RRF) across project & external `sources` Markdown sections. |
-| 5 | `smart_grep` | `pattern`, `path?`, `glob?`, `files_only?`, `case_insensitive?`, `max_per_file?`, `max_results?` | Replaces `rg -l` / `rg -n`: file-grouped regex matches (with directory prefix folding on `files_only=true`) annotated with enclosing AST symbols or Markdown headings. |
-| 6 | `run_digest` | `command`, `cwd?` | Runs shell/build/test/diff commands; groups `cargo clippy` rules, compacts `git status`/`git log`, respects `--nocapture`, enforces *never-worse*, and saves logs > 35 lines under `h:ID`. |
-| 7 | `recall` | `key`, `item?`, `failures_only?`, `filter?`, `start_line?`, `end_line?` | Pulls a single test/symbol/file-diff block (`item`), failure blocks, regex-filtered context, or line ranges from `h:ID`. |
-| 8 | `remember` | `topic`, `content`, `tags?`, `scope?` (`"project"` / `"global"` / `"handoff"` / `"backlog"`) | Appends decisions, session handoffs, or backlog items to Markdown (`.lee/.notes/`, `INDEX.md`, or `vault/`) with `[[wikilinks]]`. |
-| 9 | `recall_memory` | `query`, `budget_tokens?` (def: `600`) | Hybrid RRF recall (`cos_floor = 0.53`) across project, global, handoff, & backlog memories + 1-hop `[[wikilinks]]` expansion. |
+| 4 | `find_references` | `symbol` | Queries AST `symbol_refs` (`call`, `type_use`, `import`) to list every caller function and file referencing a symbol across the workspace. |
+| 5 | `search_docs` | `query`, `file_filter?`, `budget_tokens?` (def: `800`) | Hybrid search (FTS5 BM25 + `BGESmallENV15Q` RRF) across project & external `sources` Markdown sections. |
+| 6 | `smart_grep` | `pattern`, `path?`, `glob?`, `files_only?`, `case_insensitive?`, `max_per_file?`, `max_results?` | Replaces `rg -l` / `rg -n`: file-grouped regex matches (with directory prefix folding on `files_only=true`) annotated with enclosing AST symbols or Markdown headings. |
+| 7 | `run_digest` | `command`, `cwd?` | Runs shell/build/test/diff commands; groups `cargo clippy` rules, compacts `git status`/`git log`, respects `--nocapture`, enforces *never-worse*, and saves logs > 35 lines under `h:ID`. |
+| 8 | `recall` | `key`, `item?`, `failures_only?`, `filter?`, `start_line?`, `end_line?` | Pulls a single test/symbol/file-diff block (`item`), failure blocks, regex-filtered context, or line ranges from `h:ID`. |
+| 9 | `remember` | `topic`, `content`, `tags?`, `scope?` (`"project"` / `"global"` / `"handoff"` / `"backlog"`) | Appends decisions, session handoffs, or backlog items to Markdown (`.lee/.notes/`, `INDEX.md`, or `vault/`) with `[[wikilinks]]`. |
+| 10 | `recall_memory` | `query`, `budget_tokens?` (def: `600`) | Hybrid RRF recall (`cos_floor = 0.53`) across project, global, handoff, & backlog memories + 1-hop `[[wikilinks]]` expansion. |
 
 ### CLI Commands (`lee`)
 

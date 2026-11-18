@@ -20,12 +20,12 @@ pub fn has_verbose_test_flag(cmd: &str) -> bool {
 
 fn extract_lint_rule(block_lines: &[&str], header_line: &str) -> Option<String> {
     // Check `error[E0308]` or `warning[unused_variables]` on header line
-    if let Some(open) = header_line.find('[') {
-        if let Some(close) = header_line[open + 1..].find(']') {
-            let code = header_line[open + 1..open + 1 + close].trim();
-            if !code.is_empty() {
-                return Some(code.to_string());
-            }
+    if let Some(open) = header_line.find('[')
+        && let Some(close) = header_line[open + 1..].find(']')
+    {
+        let code = header_line[open + 1..open + 1 + close].trim();
+        if !code.is_empty() {
+            return Some(code.to_string());
         }
     }
     // Check `= note: #[warn(clippy::...)]` or `#[deny(...)]` inside block

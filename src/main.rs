@@ -210,9 +210,10 @@ fn cmd_init(paths: &AppPaths, global: bool, skip_model: bool) -> Result<()> {
 
     let stats = index_workspace(&mut local_conn, paths, None)?;
     println!(
-        "[lee] Indexed {} files ({} code symbols, {} md headings, {} doc sections) in {} ms.",
+        "[lee] Indexed {} files ({} code symbols, {} symbol refs, {} md headings, {} doc sections) in {} ms.",
         stats.files_scanned,
         stats.code_symbols,
+        stats.symbol_refs,
         stats.md_headings,
         stats.doc_sections,
         stats.elapsed_ms
@@ -262,9 +263,10 @@ fn cmd_add_source(paths: &AppPaths, source_path: &std::path::Path) -> Result<()>
     let mut conn = init_connection(&paths.local_db)?;
     let stats = index_workspace(&mut conn, paths, None)?;
     println!(
-        "[lee] Re-indexed workspace + sources: {} files, {} code symbols, {} md headings, {} doc sections ({} ms).",
+        "[lee] Re-indexed workspace + sources: {} files, {} code symbols, {} symbol refs, {} md headings, {} doc sections ({} ms).",
         stats.files_scanned,
         stats.code_symbols,
+        stats.symbol_refs,
         stats.md_headings,
         stats.doc_sections,
         stats.elapsed_ms
@@ -397,11 +399,12 @@ fn cmd_index(paths: &AppPaths) -> Result<()> {
     }
     let stats = index_workspace(&mut conn, paths, None)?;
     println!(
-        "[lee] Indexed {} files ({} re-indexed, {} cached) | {} code symbols | {} md headings | {} doc sections in {} ms.",
+        "[lee] Indexed {} files ({} re-indexed, {} cached) | {} code symbols | {} symbol refs | {} md headings | {} doc sections in {} ms.",
         stats.files_scanned,
         stats.files_reindexed,
         stats.files_cached,
         stats.code_symbols,
+        stats.symbol_refs,
         stats.md_headings,
         stats.doc_sections,
         stats.elapsed_ms
@@ -456,6 +459,9 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
                 |r| r.get(0),
             )
             .unwrap_or(0);
+        let sym_refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap_or(0);
         let headings: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM symbols WHERE kind = 'md_heading'",
@@ -473,7 +479,7 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
             .query_row("SELECT COUNT(*) FROM memories_meta", [], |r| r.get(0))
             .unwrap_or(0);
         println!(
-            "Index Counts : {files} files | {syms} code symbols | {headings} md headings | {sections} doc windows | {memories} project memories | {handles} handles"
+            "Index Counts : {files} files | {syms} code symbols | {sym_refs} symbol refs | {headings} md headings | {sections} doc windows | {memories} project memories | {handles} handles"
         );
     }
 
@@ -542,7 +548,7 @@ fn cmd_stats(paths: &AppPaths, daily: bool, history: bool) -> Result<()> {
     );
     println!(
         "\n--- Net Token Attribution ---\n\
-         MCP Tool Schema Overhead : {schema_bytes} bytes (~{schema_tokens} tokens for 9 tools)\n\
+         MCP Tool Schema Overhead : {schema_bytes} bytes (~{schema_tokens} tokens for 10 tools)\n\
          Gross Tokens Saved       : {gross_saved_tokens} tokens\n\
          Net Tokens Saved         : {net_saved_tokens} tokens ({ratio:.1}x net compression ratio)"
     );

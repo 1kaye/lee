@@ -223,6 +223,7 @@ pub fn recall_handle(
         format!("h:{key}")
     };
 
+    #[allow(clippy::type_complexity)]
     let row: Option<(String, Option<i32>, i64, String, Option<String>)> = conn
         .query_row(
             "SELECT source_cmd, exit_code, total_lines, raw_content, failures_text
@@ -257,46 +258,46 @@ pub fn recall_handle(
         return Ok((out, raw_bytes));
     }
 
-    if let Some(pat) = filter {
-        if !pat.trim().is_empty() {
-            let re = RegexBuilder::new(pat)
-                .case_insensitive(true)
-                .build()
-                .or_else(|_| {
-                    RegexBuilder::new(&regex::escape(pat))
-                        .case_insensitive(true)
-                        .build()
-                })?;
+    if let Some(pat) = filter
+        && !pat.trim().is_empty()
+    {
+        let re = RegexBuilder::new(pat)
+            .case_insensitive(true)
+            .build()
+            .or_else(|_| {
+                RegexBuilder::new(&regex::escape(pat))
+                    .case_insensitive(true)
+                    .build()
+            })?;
 
-            let mut matched_ranges: Vec<(usize, usize)> = Vec::new();
-            for (idx, line) in lines.iter().enumerate() {
-                if re.is_match(line) {
-                    let st = idx.saturating_sub(3);
-                    let en = (idx + 3).min(lines.len().saturating_sub(1));
-                    if let Some(last) = matched_ranges.last_mut() {
-                        if st <= last.1 + 1 {
-                            last.1 = last.1.max(en);
-                            continue;
-                        }
-                    }
-                    matched_ranges.push((st, en));
+        let mut matched_ranges: Vec<(usize, usize)> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if re.is_match(line) {
+                let st = idx.saturating_sub(3);
+                let en = (idx + 3).min(lines.len().saturating_sub(1));
+                if let Some(last) = matched_ranges.last_mut()
+                    && st <= last.1 + 1
+                {
+                    last.1 = last.1.max(en);
+                    continue;
                 }
+                matched_ranges.push((st, en));
             }
-
-            let mut out =
-                format!("# Recall [{normalized_key}] (filter=`{pat}`) — `{source_cmd}`\n");
-            if matched_ranges.is_empty() {
-                out.push_str("(No lines matched filter)\n");
-            } else {
-                for (st, en) in matched_ranges.into_iter().take(25) {
-                    for ln in st..=en {
-                        out.push_str(&format!("{:>4} | {}\n", ln + 1, lines[ln]));
-                    }
-                    out.push_str("---\n");
-                }
-            }
-            return Ok((out, raw_bytes));
         }
+
+        let mut out =
+            format!("# Recall [{normalized_key}] (filter=`{pat}`) — `{source_cmd}`\n");
+        if matched_ranges.is_empty() {
+            out.push_str("(No lines matched filter)\n");
+        } else {
+            for (st, en) in matched_ranges.into_iter().take(25) {
+                for (ln, line_txt) in lines.iter().enumerate().take(en + 1).skip(st) {
+                    out.push_str(&format!("{:>4} | {}\n", ln + 1, line_txt));
+                }
+                out.push_str("---\n");
+            }
+        }
+        return Ok((out, raw_bytes));
     }
 
     let st = start_line.unwrap_or(1).max(1);
@@ -320,12 +321,17 @@ pub fn recall_handle(
 fn extract_item_block(lines: &[&str], item_name: &str) -> String {
     let item_lower = item_name.to_lowercase();
 
-    // 1. Check if this is a unified diff and `item_name` matches a `diff --git` file section
+    // 1. Check if this is a unified diff or `kaye wc` output and `item_name` matches a file section
     for (idx, line) in lines.iter().enumerate() {
-        if line.starts_with("diff --git ") && line.to_lowercase().contains(&item_lower) {
+        let is_git_diff_hdr = line.starts_with("diff --git ");
+        let is_kaye_hdr = generic::parse_kaye_wc_file_header(line).is_some();
+        if (is_git_diff_hdr || is_kaye_hdr) && line.to_lowercase().contains(&item_lower) {
             let mut end_idx = (idx + 120).min(lines.len());
             for (next_idx, next_line) in lines[(idx + 1)..].iter().enumerate() {
-                if next_line.starts_with("diff --git ") {
+                if next_line.starts_with("diff --git ")
+                    || generic::parse_kaye_wc_file_header(next_line).is_some()
+                    || next_line.starts_with("====")
+                {
                     end_idx = (idx + 1 + next_idx).min(idx + 120);
                     break;
                 }

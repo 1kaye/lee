@@ -223,13 +223,79 @@ pub fn backfill_missing_memory_embeddings(conn: &Connection, models_dir: &Path) 
     Ok(updated)
 }
 
-/// Syncs any `.md` files in `.notes/` or `vault/` (excluding `INDEX.md`) that are not yet in `memories_meta`.
+/// Parses YAML frontmatter (`topic`, `tags`, `scope`, `created_at`) and strips the leading `# Title`
+/// from a `.notes/*.md` file so synced notes stay clean without raw frontmatter noise.
+fn parse_note_markdown(raw: &str, default_topic: &str, default_scope: &str) -> (String, String, String, i64, String) {
+    let mut topic = default_topic.to_string();
+    let mut tags = String::new();
+    let mut scope = default_scope.to_string();
+    let mut created_at = now_unix();
+    let mut body = raw.trim();
+
+    if let Some(after_open) = body.strip_prefix("---\n")
+        && let Some(close_idx) = after_open.find("\n---\n")
+    {
+        let fm = &after_open[..close_idx];
+        for line in fm.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim();
+                let val = v.trim().trim_matches('"').replace("\\\"", "\"");
+                match key {
+                    "topic" if !val.is_empty() => topic = val,
+                    "tags" => tags = val,
+                    "scope" if !val.is_empty() => scope = val,
+                    "created_at" => {
+                        if let Ok(ts) = val.parse::<i64>() {
+                            created_at = ts;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        body = after_open[close_idx + 5..].trim_start();
+    }
+
+    if let Some(first_line_end) = body.find('\n') {
+        let first_line = body[..first_line_end].trim();
+        if first_line.starts_with("# ") {
+            body = body[first_line_end + 1..].trim_start();
+        }
+    }
+
+    (topic, tags, scope, created_at, body.trim().to_string())
+}
+
+/// Syncs `.md` files in `.notes/` or `vault/` (excluding `INDEX.md`) with `memories_meta`,
+/// pruning any DB rows whose backing `.md` file was deleted or rolled back, and healing any
+/// legacy unparsed frontmatter rows.
 fn sync_notes_dir_to_db(
     conn: &Connection,
     dir: &Path,
     scope: &str,
     models_dir: &Path,
 ) -> Result<()> {
+    // 1. Prune stale DB entries whose backing .md file no longer exists on disk, or heal raw frontmatter rows
+    if let Ok(mut stmt) = conn.prepare("SELECT id, md_path, content FROM memories_meta WHERE md_path IS NOT NULL") {
+        let existing_rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut pruned = false;
+        for (id, md_path, content) in existing_rows {
+            if !Path::new(&md_path).exists() || content.starts_with("---\ntopic:") {
+                let _ = conn.execute("DELETE FROM memories_meta WHERE id = ?1", params![id]);
+                pruned = true;
+            }
+        }
+        if pruned && scope != "global" {
+            let _ = update_generated_notes_index(conn, dir);
+        }
+    }
+
     if !dir.is_dir() {
         return Ok(());
     }
@@ -258,17 +324,19 @@ fn sync_notes_dir_to_db(
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let topic = path
+        let default_topic = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("note")
             .replace('-', " ");
-        let emb_blob = embed_memory_passage(models_dir, &topic, scope, &raw)
+        let (topic, tags, parsed_scope, created_at, clean_body) =
+            parse_note_markdown(&raw, &default_topic, scope);
+        let emb_blob = embed_memory_passage(models_dir, &topic, &tags, &clean_body)
             .map(|v| serialize_f32_vec(&v));
         conn.execute(
             "INSERT INTO memories_meta (scope, topic, tags, content, md_path, embedding, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![scope, topic, scope, raw.trim(), path_str, emb_blob, now_unix()],
+            params![parsed_scope, topic, tags, clean_body, path_str, emb_blob, created_at],
         )?;
     }
     let _ = backfill_missing_memory_embeddings(conn, models_dir);

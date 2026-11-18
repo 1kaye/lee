@@ -17,11 +17,11 @@ use globset::GlobBuilder;
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexStats {
@@ -29,6 +29,7 @@ pub struct IndexStats {
     pub files_reindexed: usize,
     pub files_cached: usize,
     pub code_symbols: usize,
+    pub symbol_refs: usize,
     pub md_headings: usize,
     pub doc_sections: usize,
     pub total_raw_bytes: usize,
@@ -140,31 +141,66 @@ pub fn index_workspace(
 
     let tx = conn.transaction()?;
 
+    // Preload all existing file hashes and timestamps in 1 query for O(1) lookup & mtime fast-path
+    let existing_db_map: HashMap<String, (String, i64, usize)> = {
+        let mut stmt = tx.prepare_cached(
+            "SELECT file_path, blake3_hash, last_indexed, line_count FROM file_hashes",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3).unwrap_or(1) as usize,
+                    ),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+
     for file_path in &files {
+        let index_key = to_index_path(&paths.project_root, file_path);
+        seen_keys.insert(index_key.clone());
+
+        let expected_suffix = match IndexedFileType::classify(file_path) {
+            Some(IndexedFileType::Markdown) => ":md2",
+            Some(IndexedFileType::Code(_)) => ":r1",
+            _ => "",
+        };
+
+        // Fast-path: if file mtime is strictly older than last_indexed (at least 1s earlier)
+        // and the stored hash already carries the current schema suffix, skip disk read + blake3
+        if let Some((old_hash, last_idx, line_cnt)) = existing_db_map.get(&index_key)
+            && (expected_suffix.is_empty() || old_hash.ends_with(expected_suffix))
+            && let Ok(meta) = fs::metadata(file_path)
+            && let Ok(mtime) = meta.modified()
+            && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
+            && (dur.as_secs() as i64) < *last_idx
+        {
+            stats.files_scanned += 1;
+            stats.files_cached += 1;
+            stats.total_raw_bytes += (meta.len() as usize).max(line_cnt * 40);
+            continue;
+        }
+
         let Ok(raw_content) = fs::read_to_string(file_path) else {
             continue;
         };
         stats.files_scanned += 1;
         stats.total_raw_bytes += raw_content.len();
 
-        let index_key = to_index_path(&paths.project_root, file_path);
-        seen_keys.insert(index_key.clone());
         let raw_hash = blake3::hash(raw_content.as_bytes()).to_hex().to_string();
-        let new_hash = match IndexedFileType::classify(file_path) {
-            Some(IndexedFileType::Markdown) => format!("{raw_hash}:md2"),
-            Some(IndexedFileType::Code(_)) => format!("{raw_hash}:r1"),
-            _ => raw_hash,
-        };
+        let new_hash = format!("{raw_hash}{expected_suffix}");
 
-        let existing_hash: Option<String> = tx
-            .query_row(
-                "SELECT blake3_hash FROM file_hashes WHERE file_path = ?1",
-                params![&index_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        if existing_hash.as_deref() == Some(new_hash.as_str()) {
+        if existing_db_map
+            .get(&index_key)
+            .map(|(h, _, _)| h.as_str())
+            == Some(new_hash.as_str())
+        {
             stats.files_cached += 1;
             continue;
         }
@@ -177,20 +213,10 @@ pub fn index_workspace(
 
     // If this was a full workspace scan, prune any files from SQLite that were deleted/reverted on disk
     if include_sources {
-        let existing_db_paths: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT file_path FROM file_hashes")?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
-        for db_path in existing_db_paths {
-            if !seen_keys.contains(&db_path) {
-                tx.execute(
-                    "DELETE FROM file_hashes WHERE file_path = ?1",
-                    params![&db_path],
-                )?;
+        let mut del_stmt = tx.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?;
+        for db_path in existing_db_map.keys() {
+            if !seen_keys.contains(db_path) {
+                del_stmt.execute(params![db_path])?;
             }
         }
     }
@@ -208,6 +234,11 @@ pub fn index_workspace(
             [],
             |r| r.get::<_, i64>(0),
         )
+        .unwrap_or(0) as usize;
+    stats.symbol_refs = conn
+        .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| {
+            r.get::<_, i64>(0)
+        })
         .unwrap_or(0) as usize;
     stats.md_headings = conn
         .query_row(
@@ -293,28 +324,28 @@ fn upsert_parsed_file(
     blake3_hash: &str,
     parsed: &parser::ParsedFileResult,
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM file_hashes WHERE file_path = ?1",
-        params![index_key],
-    )?;
+    conn.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?
+        .execute(params![index_key])?;
 
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO file_hashes (file_path, blake3_hash, line_count, file_type, last_indexed)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            index_key,
-            blake3_hash,
-            parsed.line_count as i64,
-            parsed.file_type.as_db_str(),
-            now_unix()
-        ],
-    )?;
+    )?
+    .execute(params![
+        index_key,
+        blake3_hash,
+        parsed.line_count as i64,
+        parsed.file_type.as_db_str(),
+        now_unix()
+    ])?;
 
-    for sym in &parsed.symbols {
-        conn.execute(
+    {
+        let mut sym_stmt = conn.prepare_cached(
             "INSERT INTO symbols (file_path, name, kind, signature, start_line, end_line, parent_name)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+        )?;
+        for sym in &parsed.symbols {
+            sym_stmt.execute(params![
                 index_key,
                 sym.name,
                 sym.kind,
@@ -322,36 +353,40 @@ fn upsert_parsed_file(
                 sym.start_line as i64,
                 sym.end_line as i64,
                 sym.parent_name,
-            ],
-        )?;
+            ])?;
+        }
     }
 
-    for r in &parsed.symbol_refs {
-        conn.execute(
+    {
+        let mut ref_stmt = conn.prepare_cached(
             "INSERT INTO symbol_refs (symbol_name, file_path, caller_symbol, line_number, ref_kind)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
+        )?;
+        for r in &parsed.symbol_refs {
+            ref_stmt.execute(params![
                 r.symbol_name,
                 index_key,
                 r.caller_symbol,
                 r.line_number as i64,
                 r.ref_kind,
-            ],
-        )?;
+            ])?;
+        }
     }
 
-    for sec in &parsed.doc_sections {
-        conn.execute(
+    {
+        let mut sec_stmt = conn.prepare_cached(
             "INSERT INTO doc_sections_meta (file_path, heading, start_line, end_line, content, embedding)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-            params![
+        )?;
+        for sec in &parsed.doc_sections {
+            sec_stmt.execute(params![
                 index_key,
                 sec.heading,
                 sec.start_line as i64,
                 sec.end_line as i64,
                 sec.content,
-            ],
-        )?;
+            ])?;
+        }
     }
 
     Ok(())
@@ -777,13 +812,23 @@ pub fn read_symbol_range(
     let effective_file_arg = if let Some(fa) = file_arg.filter(|s| !s.trim().is_empty()) {
         fa
     } else if let Some(sym_query) = symbol {
-        let clean_query = sym_query.trim().trim_start_matches('#').trim();
+        let raw_clean = sym_query.trim().trim_start_matches('#').trim();
+        let (parent_hint, clean_query) = if let Some((p, s)) = raw_clean.rsplit_once("::") {
+            (Some(p.rsplit("::").next().unwrap_or(p).trim()), s.trim())
+        } else if !raw_clean.contains(' ')
+            && let Some((p, s)) = raw_clean.rsplit_once('.')
+        {
+            (Some(p.trim()), s.trim())
+        } else {
+            (None, raw_clean)
+        };
         let find_matches = |c: &Connection| -> Result<Vec<(String, String, String, i64, i64)>> {
             let mut stmt = c.prepare(
                 "SELECT file_path, kind, name, start_line, end_line
                  FROM symbols
                  WHERE name = ?1 OR signature = ?2 OR LOWER(name) LIKE LOWER(?3)
                  ORDER BY
+                   CASE WHEN ?4 IS NOT NULL AND parent_name = ?4 THEN 0 ELSE 1 END,
                    CASE WHEN name = ?1 THEN 0 WHEN LOWER(name) = LOWER(?1) THEN 1 ELSE 2 END,
                    CASE WHEN file_path LIKE '/%' THEN 1 ELSE 0 END ASC,
                    CASE WHEN parent_name = 'tests' THEN 1 ELSE 0 END ASC,
@@ -794,7 +839,7 @@ pub fn read_symbol_range(
             )?;
             let rows = stmt
                 .query_map(
-                    params![clean_query, sym_query.trim(), format!("%{clean_query}%")],
+                    params![clean_query, sym_query.trim(), format!("%{clean_query}%"), parent_hint],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )?
                 .filter_map(|r| r.ok())
@@ -802,11 +847,8 @@ pub fn read_symbol_range(
             Ok(rows)
         };
 
-        let mut matches = find_matches(conn)?;
-        if matches.is_empty() {
-            let _ = index_workspace(conn, paths, None);
-            matches = find_matches(conn)?;
-        }
+        let _ = index_workspace(conn, paths, None);
+        let matches = find_matches(conn)?;
 
         let Some(first) = matches.first() else {
             bail!(
@@ -833,20 +875,33 @@ pub fn read_symbol_range(
     let total_lines = lines.len().max(1);
 
     let (target_start, target_end, header_label) = if let Some(sym_query) = symbol {
-        let clean_query = sym_query.trim().trim_start_matches('#').trim();
+        let raw_clean = sym_query.trim().trim_start_matches('#').trim();
+        let (parent_hint, clean_query) = if let Some((p, s)) = raw_clean.rsplit_once("::") {
+            (Some(p.rsplit("::").next().unwrap_or(p).trim()), s.trim())
+        } else if !raw_clean.contains(' ')
+            && let Some((p, s)) = raw_clean.rsplit_once('.')
+        {
+            (Some(p.trim()), s.trim())
+        } else {
+            (None, raw_clean)
+        };
         let row: Option<(String, String, i64, i64)> = conn
             .query_row(
                 "SELECT name, signature, start_line, end_line
                  FROM symbols
                  WHERE file_path = ?1
                    AND (name = ?2 OR signature = ?3 OR LOWER(name) LIKE LOWER(?4) OR LOWER(signature) LIKE LOWER(?4))
-                 ORDER BY CASE WHEN name = ?2 THEN 0 WHEN LOWER(name) = LOWER(?2) THEN 1 ELSE 2 END, start_line ASC
+                 ORDER BY
+                   CASE WHEN ?5 IS NOT NULL AND parent_name = ?5 THEN 0 ELSE 1 END,
+                   CASE WHEN name = ?2 THEN 0 WHEN LOWER(name) = LOWER(?2) THEN 1 ELSE 2 END,
+                   start_line ASC
                  LIMIT 1",
                 params![
                     &index_key,
                     clean_query,
                     sym_query.trim(),
-                    format!("%{clean_query}%")
+                    format!("%{clean_query}%"),
+                    parent_hint
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -867,10 +922,11 @@ pub fn read_symbol_range(
             format!("lines {st}..{en}"),
         )
     } else if let Some(st) = start_line {
-        let en = (st + 60).min(total_lines);
+        let en = end_line.unwrap_or((st + max_lines).min(total_lines));
         (st.max(1), en, format!("lines {st}..{en}"))
     } else {
-        bail!("Provide either `symbol` or `start_line`/`end_line` to read_symbol");
+        let en = max_lines.max(20).min(total_lines);
+        (1, en, format!("lines 1..{en}"))
     };
 
     let actual_start = target_start.saturating_sub(context_lines).max(1);
@@ -1340,7 +1396,15 @@ pub fn find_symbol_references(
     paths: &AppPaths,
     symbol: &str,
 ) -> Result<(String, usize)> {
-    let clean = symbol.trim();
+    let raw_trimmed = symbol.trim();
+    let clean = raw_trimmed
+        .rsplit("::")
+        .next()
+        .unwrap_or(raw_trimmed)
+        .rsplit('.')
+        .next()
+        .unwrap_or(raw_trimmed)
+        .trim();
     if clean.is_empty() {
         bail!("Provide a non-empty `symbol` to `find_references`");
     }
@@ -1373,13 +1437,59 @@ pub fn find_symbol_references(
         .collect();
 
     if rows.is_empty() {
-        let msg = format!("No references found for symbol '{clean}'.");
+        let mut sugg_stmt = conn.prepare(
+            "SELECT DISTINCT name FROM (
+                SELECT name FROM symbols WHERE kind != 'md_heading' AND LOWER(name) LIKE LOWER(?1)
+                UNION
+                SELECT symbol_name AS name FROM symbol_refs WHERE LOWER(symbol_name) LIKE LOWER(?1)
+             ) ORDER BY LENGTH(name) ASC LIMIT 5",
+        )?;
+        let suggestions: Vec<String> = sugg_stmt
+            .query_map(params![format!("%{clean}%")], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let hint = if suggestions.is_empty() {
+            String::new()
+        } else {
+            format!(" Did you mean: `{}`?", suggestions.join("`, `"))
+        };
+        let msg = format!("No references found for symbol '{clean}'.{hint}");
         return Ok((msg.clone(), stats.total_raw_bytes.max(msg.len())));
     }
 
+    let defs: Vec<String> = {
+        let mut def_stmt = conn.prepare(
+            "SELECT file_path, kind, start_line, end_line
+             FROM symbols
+             WHERE name = ?1 AND kind != 'md_heading'
+             ORDER BY CASE WHEN file_path LIKE '/%' THEN 1 ELSE 0 END ASC, file_path ASC, start_line ASC
+             LIMIT 3",
+        )?;
+        def_stmt
+            .query_map(params![clean], |r| {
+                Ok(format!(
+                    "{}:{}..{} ({})",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(1)?
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
     let mut seen_files = HashSet::new();
     let mut raw_bytes = 0usize;
-    let mut out = format!("{clean} dipakai di {} lokasi:\n", rows.len());
+    let mut out = if defs.is_empty() {
+        format!("{clean} referenced in {} location(s):\n", rows.len())
+    } else {
+        format!(
+            "{clean} referenced in {} location(s) (defined at: {}):\n",
+            rows.len(),
+            defs.join(", ")
+        )
+    };
 
     for (fp, line, caller, kind, line_cnt) in &rows {
         if seen_files.insert(fp.clone()) {

@@ -218,12 +218,15 @@ mod tests {
     fn test_rust_ts_svelte_python_go_parsing() {
         // Rust
         let rs_code = r#"
+use crate::net::Socket;
+
 pub struct Config {
     pub port: u16,
 }
 
 impl Config {
     pub fn new(port: u16) -> Self {
+        let _ = Socket::connect(port);
         Self { port }
     }
 }
@@ -233,6 +236,8 @@ impl Config {
             .unwrap();
         assert!(rs_res.symbols.iter().any(|s| s.name == "Config" && s.kind == "struct"));
         assert!(rs_res.symbols.iter().any(|s| s.name == "new" && s.kind == "fn" && s.parent_name.as_deref() == Some("Config")));
+        assert!(rs_res.symbol_refs.iter().any(|r| r.symbol_name == "Socket" && r.ref_kind == "import"));
+        assert!(rs_res.symbol_refs.iter().any(|r| r.symbol_name == "connect" && r.ref_kind == "call" && r.caller_symbol.as_deref() == Some("new")));
 
         // TypeScript arrow function & interface
         let ts_code = r#"

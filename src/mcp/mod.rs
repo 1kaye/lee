@@ -266,7 +266,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(refs_txt.contains("Engine dipakai di"));
+        assert!(refs_txt.contains("Engine referenced in"));
         assert!(refs_txt.contains("src/caller.rs:1 [import]"));
         assert!(refs_txt.contains("src/caller.rs:2 [in fn boot] (type_use)"));
         assert!(refs_txt.contains("src/caller.rs:3 [in fn boot] (call)"));
