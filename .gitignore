@@ -1,4 +1,6 @@
 /target
 .kaye/
 .lee/
+.cargo/
 .agents/plugins/lee/
+.agents/plugins/kaye/

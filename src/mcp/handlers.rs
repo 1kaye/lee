@@ -123,12 +123,14 @@ fn execute_tool(
             let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
                 bail!("Missing required parameter `query`");
             };
+            let doc_name = args.get("doc").and_then(|v| v.as_str());
+            let scope = args.get("scope").and_then(|v| v.as_str());
             let file_filter = args.get("file_filter").and_then(|v| v.as_str());
             let budget_tokens = args
                 .get("budget_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(800) as usize;
-            search_docs_hybrid(conn, paths, query, file_filter, budget_tokens)
+            search_docs_hybrid(conn, paths, query, file_filter, doc_name, scope, budget_tokens)
         }
         "smart_grep" => {
             let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {

@@ -7,7 +7,7 @@ pub mod mcp;
 pub mod memory;
 pub mod security;
 
-use crate::config::AppPaths;
+use crate::config::{default_doc_name, AppPaths, DocEntry, DocScope};
 use crate::db::{
     init_connection, query_daily_token_metrics, query_recent_token_history, query_token_metrics,
     record_token_metric,
@@ -62,17 +62,39 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Register an external code/documentation directory or file for read-only indexing (search_docs, smart_grep, outline, read_symbol)
-    AddSource {
-        /// Path to the external directory or file
+    /// Register a named external code/documentation directory or file (`--w` workspace, `--g` global)
+    #[command(alias = "add-source")]
+    AddDocs {
+        /// Path to the documentation or code directory/file
         path: PathBuf,
+        /// Custom name for this docs entry (prompts interactively if omitted)
+        #[arg(short = 'n', long = "name")]
+        name: Option<String>,
+        /// Register in current workspace (.lee/config.json, default)
+        #[arg(short = 'w', long = "workspace", visible_alias = "w", conflicts_with = "global")]
+        workspace: bool,
+        /// Register globally (~/.config/lee/config.json, available in all workspaces)
+        #[arg(short = 'g', long = "global", visible_alias = "g", conflicts_with = "workspace")]
+        global: bool,
     },
-    /// Remove a registered external source (or `--all`) from config and SQLite index
-    #[command(visible_alias = "rm-source")]
-    RemoveSource {
-        /// Path or 1-based number of the external source to remove
-        path: Option<PathBuf>,
-        /// Remove all registered external sources
+    /// List registered workspace and global docs (use `--json` for LLM/machine output)
+    Docs {
+        /// Output machine-readable JSON (for LLMs and scripts)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a registered workspace or global doc (or `--all`) from config and SQLite index
+    #[command(visible_alias = "rm-docs", alias = "rm-source", alias = "remove-source")]
+    RemoveDocs {
+        /// Name, path, or 1-based number of the doc to remove
+        target: Option<String>,
+        /// Target workspace docs only
+        #[arg(short = 'w', long = "workspace", visible_alias = "w", conflicts_with = "global")]
+        workspace: bool,
+        /// Target global docs only
+        #[arg(short = 'g', long = "global", visible_alias = "g", conflicts_with = "workspace")]
+        global: bool,
+        /// Remove all registered docs in the target scope (workspace by default, or global with `--g`)
         #[arg(long)]
         all: bool,
     },
@@ -133,8 +155,36 @@ fn main() -> Result<()> {
         Commands::Serve => run_stdio_server(&paths),
         Commands::Init { global, skip_model } => cmd_init(&paths, global, skip_model),
         Commands::Exec { command } => cmd_exec(&paths, &command),
-        Commands::AddSource { path } => cmd_add_source(&paths, &path),
-        Commands::RemoveSource { path, all } => cmd_remove_source(&paths, path.as_deref(), all),
+        Commands::AddDocs {
+            path,
+            name,
+            workspace,
+            global,
+        } => {
+            let _ = workspace; // default scope when neither --w nor --g is set
+            let scope = if global {
+                DocScope::Global
+            } else {
+                DocScope::Workspace
+            };
+            cmd_add_docs(&paths, &path, name.as_deref(), scope)
+        }
+        Commands::Docs { json } => cmd_docs(&paths, json),
+        Commands::RemoveDocs {
+            target,
+            workspace,
+            global,
+            all,
+        } => {
+            let scope_filter = if global {
+                Some(DocScope::Global)
+            } else if workspace {
+                Some(DocScope::Workspace)
+            } else {
+                None
+            };
+            cmd_remove_docs(&paths, target.as_deref(), scope_filter, all)
+        }
         Commands::Index => cmd_index(&paths),
         Commands::Status => cmd_status(&paths),
         Commands::Stats { daily, history } => cmd_stats(&paths, daily, history),
@@ -252,86 +302,180 @@ fn cmd_discover(custom_path: Option<&std::path::Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_add_source(paths: &AppPaths, source_path: &std::path::Path) -> Result<()> {
-    paths.ensure_local_dirs()?;
-    let canonical = paths.add_source(source_path)?;
+fn cmd_add_docs(
+    paths: &AppPaths,
+    source_path: &std::path::Path,
+    name: Option<&str>,
+    scope: DocScope,
+) -> Result<()> {
+    let canonical = fs::canonicalize(source_path)
+        .map_err(|e| anyhow::anyhow!("Docs path does not exist: {} ({e})", source_path.display()))?;
+
+    let final_name = match name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None => {
+            let default_name = default_doc_name(&canonical);
+            print!("Enter doc name [default: {default_name}]: ");
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let chosen = input.trim();
+            if chosen.is_empty() {
+                default_name
+            } else {
+                chosen.to_string()
+            }
+        }
+    };
+
+    match scope {
+        DocScope::Workspace => paths.ensure_local_dirs()?,
+        DocScope::Global => paths.ensure_global_dirs()?,
+    }
+
+    let entry = paths.add_doc(scope, &canonical, &final_name)?;
     println!(
-        "[lee] Registered external documentation source: {}",
-        canonical.display()
+        "[lee] Registered {} doc '{}' -> {}",
+        scope.as_str(),
+        entry.name,
+        entry.path.display()
     );
 
-    let mut conn = init_connection(&paths.local_db)?;
-    let stats = index_workspace(&mut conn, paths, None)?;
-    println!(
-        "[lee] Re-indexed workspace + sources: {} files, {} code symbols, {} symbol refs, {} md headings, {} doc sections ({} ms).",
-        stats.files_scanned,
-        stats.code_symbols,
-        stats.symbol_refs,
-        stats.md_headings,
-        stats.doc_sections,
-        stats.elapsed_ms
-    );
+    if scope == DocScope::Workspace || paths.local_db.exists() {
+        let mut conn = init_connection(&paths.local_db)?;
+        let stats = index_workspace(&mut conn, paths, None)?;
+        println!(
+            "[lee] Re-indexed workspace + docs: {} files, {} code symbols, {} symbol refs, {} md headings, {} doc sections ({} ms).",
+            stats.files_scanned,
+            stats.code_symbols,
+            stats.symbol_refs,
+            stats.md_headings,
+            stats.doc_sections,
+            stats.elapsed_ms
+        );
+    } else {
+        println!(
+            "[lee] Saved globally in {}. It will be indexed automatically in any workspace on next query or `lee index`.",
+            paths.global_config_file.display()
+        );
+    }
     Ok(())
 }
 
-fn cmd_remove_source(
+fn cmd_docs(paths: &AppPaths, as_json: bool) -> Result<()> {
+    let ws_docs = paths.load_config().unwrap_or_default().docs;
+    let global_docs = paths.load_global_config().unwrap_or_default().docs;
+
+    if as_json {
+        let payload = serde_json::json!({
+            "workspace": ws_docs,
+            "global": global_docs,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    println!("Workspace Docs ({}):", ws_docs.len());
+    if ws_docs.is_empty() {
+        println!("  (none)");
+    } else {
+        for (i, doc) in ws_docs.iter().enumerate() {
+            println!("  [{}] {} -> {}", i + 1, doc.name, doc.path.display());
+        }
+    }
+
+    println!("\nGlobal Docs ({}):", global_docs.len());
+    if global_docs.is_empty() {
+        println!("  (none)");
+    } else {
+        for (i, doc) in global_docs.iter().enumerate() {
+            println!("  [{}] {} -> {}", i + 1, doc.name, doc.path.display());
+        }
+    }
+    Ok(())
+}
+
+fn purge_removed_docs_if_unused(paths: &AppPaths, removed: &[DocEntry]) -> Result<usize> {
+    if !paths.local_db.exists() {
+        return Ok(0);
+    }
+    let remaining = paths.all_doc_paths();
+    let conn = init_connection(&paths.local_db)?;
+    let mut total = 0usize;
+    for entry in removed {
+        if !remaining.contains(&entry.path) {
+            total += purge_source_from_db(&conn, &entry.path)?;
+        }
+    }
+    Ok(total)
+}
+
+fn cmd_remove_docs(
     paths: &AppPaths,
-    source_path: Option<&std::path::Path>,
+    target: Option<&str>,
+    scope_filter: Option<DocScope>,
     all: bool,
 ) -> Result<()> {
-    use std::io::Write;
-    paths.ensure_local_dirs()?;
-    let conn = init_connection(&paths.local_db)?;
-
     if all {
-        let removed_list = paths.clear_sources()?;
-        let mut total_purged = 0usize;
-        for src in &removed_list {
-            total_purged += purge_source_from_db(&conn, src)?;
-        }
+        let scope = scope_filter.unwrap_or(DocScope::Workspace);
+        let removed_list = paths.clear_docs(scope)?;
+        let total_purged = purge_removed_docs_if_unused(paths, &removed_list)?;
         println!(
-            "[lee] Removed all {} external source(s) and purged {} indexed file(s) from SQLite.",
+            "[lee] Removed all {} {} doc(s) and purged {} indexed file(s) from SQLite.",
             removed_list.len(),
+            scope.as_str(),
             total_purged
         );
         return Ok(());
     }
 
-    let cfg = paths.load_config().unwrap_or_default();
+    let mut entries: Vec<(DocScope, DocEntry)> = Vec::new();
+    if scope_filter.is_none() || scope_filter == Some(DocScope::Workspace) {
+        for d in paths.load_config().unwrap_or_default().docs {
+            entries.push((DocScope::Workspace, d));
+        }
+    }
+    if scope_filter.is_none() || scope_filter == Some(DocScope::Global) {
+        for d in paths.load_global_config().unwrap_or_default().docs {
+            entries.push((DocScope::Global, d));
+        }
+    }
 
-    // If no argument provided, show numbered list and interactive selection prompt
-    let target_buf: PathBuf = match source_path {
+    let chosen: (Option<DocScope>, String) = match target {
         Some(arg) => {
-            // Also allow passing 1-based number directly: `lee rm-source 1`
-            if let Some(num_str) = arg.to_str() {
-                if let Ok(idx) = num_str.parse::<usize>() {
-                    if idx >= 1 && idx <= cfg.sources.len() {
-                        cfg.sources[idx - 1].clone()
-                    } else {
-                        anyhow::bail!(
-                            "Invalid source number {idx} (registered sources: 1..={}).",
-                            cfg.sources.len()
-                        );
-                    }
+            if let Ok(idx) = arg.trim().parse::<usize>() {
+                if idx >= 1 && idx <= entries.len() {
+                    let (sc, ref entry) = entries[idx - 1];
+                    (Some(sc), entry.path.to_string_lossy().to_string())
                 } else {
-                    arg.to_path_buf()
+                    anyhow::bail!(
+                        "Invalid doc number {idx} (registered docs: 1..={}).",
+                        entries.len()
+                    );
                 }
             } else {
-                arg.to_path_buf()
+                (scope_filter, arg.to_string())
             }
         }
         None => {
-            if cfg.sources.is_empty() {
-                println!("[lee] No external documentation sources registered.");
+            if entries.is_empty() {
+                println!("[lee] No docs registered.");
                 return Ok(());
             }
-            println!("Registered External Documentation Sources:");
-            for (i, src) in cfg.sources.iter().enumerate() {
-                println!("  [{}] {}", i + 1, src.display());
+            println!("Registered Docs:");
+            for (i, (sc, doc)) in entries.iter().enumerate() {
+                println!(
+                    "  [{}] [{}] {} -> {}",
+                    i + 1,
+                    sc.as_str(),
+                    doc.name,
+                    doc.path.display()
+                );
             }
-            println!("  [a] Remove all sources");
+            let clear_scope = scope_filter.unwrap_or(DocScope::Workspace);
+            println!("  [a] Remove all {} docs", clear_scope.as_str());
             println!("  [q] Cancel");
-            print!("\nSelect source to remove [1-{}/a/q]: ", cfg.sources.len());
+            print!("\nSelect doc to remove [1-{}/a/q]: ", entries.len());
             io::stdout().flush()?;
 
             let mut input = String::new();
@@ -343,48 +487,61 @@ fn cmd_remove_source(
                 return Ok(());
             }
             if choice.eq_ignore_ascii_case("a") || choice.eq_ignore_ascii_case("all") {
-                let removed_list = paths.clear_sources()?;
-                let mut total_purged = 0usize;
-                for src in &removed_list {
-                    total_purged += purge_source_from_db(&conn, src)?;
-                }
+                let removed_list = paths.clear_docs(clear_scope)?;
+                let total_purged = purge_removed_docs_if_unused(paths, &removed_list)?;
                 println!(
-                    "[lee] Removed all {} external source(s) and purged {} indexed file(s) from SQLite.",
+                    "[lee] Removed all {} {} doc(s) and purged {} indexed file(s) from SQLite.",
                     removed_list.len(),
+                    clear_scope.as_str(),
                     total_purged
                 );
                 return Ok(());
             }
             if let Ok(idx) = choice.parse::<usize>() {
-                if idx >= 1 && idx <= cfg.sources.len() {
-                    cfg.sources[idx - 1].clone()
+                if idx >= 1 && idx <= entries.len() {
+                    let (sc, ref entry) = entries[idx - 1];
+                    (Some(sc), entry.path.to_string_lossy().to_string())
                 } else {
                     anyhow::bail!(
                         "Invalid selection '{choice}'. Expected 1..={}.",
-                        cfg.sources.len()
+                        entries.len()
                     );
                 }
             } else {
-                PathBuf::from(choice)
+                (scope_filter, choice.to_string())
             }
         }
     };
 
-    if let Some(removed) = paths.remove_source(&target_buf)? {
-        let purged = purge_source_from_db(&conn, &removed)?;
-        println!(
-            "[lee] Removed external source '{}' and purged {} indexed file(s) from SQLite.",
-            removed.display(),
-            purged
-        );
-    } else {
-        let purged = purge_source_from_db(&conn, &target_buf)?;
-        println!(
-            "[lee] Source '{}' was not in config.json (purged {} matching DB entries).",
-            target_buf.display(),
-            purged
-        );
+    let scopes_to_try: Vec<DocScope> = match chosen.0 {
+        Some(sc) => vec![sc],
+        None => vec![DocScope::Workspace, DocScope::Global],
+    };
+
+    for sc in scopes_to_try {
+        if let Some(removed) = paths.remove_doc(sc, &chosen.1)? {
+            let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
+            println!(
+                "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s) from SQLite.",
+                sc.as_str(),
+                removed.name,
+                removed.path.display(),
+                purged
+            );
+            return Ok(());
+        }
     }
+
+    let purged = if paths.local_db.exists() {
+        let conn = init_connection(&paths.local_db)?;
+        purge_source_from_db(&conn, std::path::Path::new(&chosen.1))?
+    } else {
+        0
+    };
+    println!(
+        "[lee] Doc '{}' was not found in config (purged {} matching DB entries).",
+        chosen.1, purged
+    );
     Ok(())
 }
 
@@ -413,7 +570,8 @@ fn cmd_index(paths: &AppPaths) -> Result<()> {
 }
 
 fn cmd_status(paths: &AppPaths) -> Result<()> {
-    let cfg = paths.load_config().unwrap_or_default();
+    let ws_docs = paths.load_config().unwrap_or_default().docs;
+    let global_docs = paths.load_global_config().unwrap_or_default().docs;
     let model_ready = is_model_cached(&paths.models_dir);
 
     println!("=== lee Status ===");
@@ -438,12 +596,21 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
         }
     );
 
-    if cfg.sources.is_empty() {
-        println!("Ext Sources  : (none)");
+    if ws_docs.is_empty() {
+        println!("Workspace Docs: (none)");
     } else {
-        println!("Ext Sources  : {} registered", cfg.sources.len());
-        for src in &cfg.sources {
-            println!("  - {}", src.display());
+        println!("Workspace Docs: {} registered", ws_docs.len());
+        for doc in &ws_docs {
+            println!("  - {} -> {}", doc.name, doc.path.display());
+        }
+    }
+
+    if global_docs.is_empty() {
+        println!("Global Docs  : (none)");
+    } else {
+        println!("Global Docs  : {} registered", global_docs.len());
+        for doc in &global_docs {
+            println!("  - {} -> {}", doc.name, doc.path.display());
         }
     }
 
@@ -748,4 +915,40 @@ fn cmd_hook(paths: &AppPaths, event: HookEvent, query: Option<&str>) -> Result<(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_docs_flags_parsing() {
+        let cli = Cli::try_parse_from(["lee", "add-docs", "--w", "/tmp/gpui"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::AddDocs { workspace: true, global: false, name: None, .. }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "lee", "add-docs", "--g", "/tmp/gpui", "--name", "gpui kit",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::AddDocs { workspace: false, global: true, name: Some(ref n), .. } if n == "gpui kit"
+        ));
+
+        let cli = Cli::try_parse_from(["lee", "docs", "--json"]).unwrap();
+        assert!(matches!(cli.command, Commands::Docs { json: true }));
+
+        let cli = Cli::try_parse_from(["lee", "rm-docs", "--g", "gpui kit"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::RemoveDocs { global: true, workspace: false, target: Some(ref t), .. } if t == "gpui kit"
+        ));
+
+        // Legacy alias still parses
+        let cli = Cli::try_parse_from(["lee", "add-source", "/tmp/gpui"]).unwrap();
+        assert!(matches!(cli.command, Commands::AddDocs { .. }));
+    }
 }

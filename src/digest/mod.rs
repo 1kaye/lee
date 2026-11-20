@@ -56,10 +56,10 @@ pub fn run_command_digest_with_exit(
 ) -> Result<(String, usize, i32)> {
     validate_command(command)?;
 
-    let cfg = paths.load_config().unwrap_or_default();
+    let allowed_docs = paths.all_doc_paths();
     let work_dir = match cwd {
         Some(dir) if !dir.trim().is_empty() && dir.trim() != "." => {
-            validate_path(&paths.project_root, &cfg.sources, std::path::Path::new(dir))?
+            validate_path(&paths.project_root, &allowed_docs, std::path::Path::new(dir))?
         }
         _ => paths.project_root.clone(),
     };

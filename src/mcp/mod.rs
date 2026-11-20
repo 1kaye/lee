@@ -148,6 +148,7 @@ mod tests {
         let mut paths = AppPaths::from_root(temp.clone()).unwrap();
         paths.global_dir = temp.join("global_cfg");
         paths.global_db = paths.global_dir.join("global.db");
+        paths.global_config_file = paths.global_dir.join("config.json");
         paths.models_dir = paths.global_dir.join("models");
         paths.vault_dir = paths.global_dir.join("vault");
         paths.ensure_local_dirs().unwrap();
@@ -283,6 +284,54 @@ mod tests {
             .to_string();
         assert!(fn_refs_txt.contains("src/caller.rs:3 [in fn boot] (call)"));
         assert!(fn_refs_txt.contains("src/caller.rs:4 [in fn boot] (call)"));
+
+        // 8. Named workspace & global docs filtering via `search_docs(doc=..., scope=...)`
+        let ws_doc_dir = temp.join("ext_ws_gpui");
+        let gl_doc_dir = temp.join("ext_global_gpui");
+        fs::create_dir_all(&ws_doc_dir).unwrap();
+        fs::create_dir_all(&gl_doc_dir).unwrap();
+        fs::write(
+            ws_doc_dir.join("button.md"),
+            "# Workspace Button\n\nWorkspace-specific button token alpha.\n",
+        )
+        .unwrap();
+        fs::write(
+            gl_doc_dir.join("button.md"),
+            "# Global Button\n\nGlobal-specific button token omega.\n",
+        )
+        .unwrap();
+        paths
+            .add_doc(crate::config::DocScope::Workspace, &ws_doc_dir, "gpui kit")
+            .unwrap();
+        paths
+            .add_doc(crate::config::DocScope::Global, &gl_doc_dir, "gpui kit")
+            .unwrap();
+
+        let gl_resp = handle_jsonrpc_message(
+            &mut conn,
+            &paths,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"button","doc":"gpui kit","scope":"global"}}}"#,
+        )
+        .unwrap();
+        let gl_txt = gl_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(gl_txt.contains("Global Button"));
+        assert!(!gl_txt.contains("Workspace Button"));
+
+        let ws_resp = handle_jsonrpc_message(
+            &mut conn,
+            &paths,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"button","doc":"gpui kit","scope":"workspace"}}}"#,
+        )
+        .unwrap();
+        let ws_txt = ws_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(ws_txt.contains("Workspace Button"));
+        assert!(!ws_txt.contains("Global Button"));
 
         let _ = fs::remove_dir_all(&temp);
     }

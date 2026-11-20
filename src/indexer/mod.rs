@@ -119,18 +119,19 @@ pub fn index_workspace(
     subpath: Option<&str>,
 ) -> Result<IndexStats> {
     let start_instant = Instant::now();
-    let cfg = paths.load_config().unwrap_or_default();
+    // shortcut: global docs index into each workspace's local_db (mtime+blake3 cached); split to global_db if many repos share huge global doc trees
+    let all_docs = paths.all_doc_paths();
 
     let scan_root = match subpath {
         Some(sp) if !sp.is_empty() && sp != "." => {
-            validate_path(&paths.project_root, &cfg.sources, Path::new(sp))?
+            validate_path(&paths.project_root, &all_docs, Path::new(sp))?
         }
         _ => paths.project_root.clone(),
     };
 
     let include_sources = subpath.is_none() || subpath == Some(".");
     let extra_sources = if include_sources {
-        cfg.sources.as_slice()
+        all_docs.as_slice()
     } else {
         &[]
     };
@@ -399,22 +400,22 @@ pub fn ensure_single_file_indexed(
     paths: &AppPaths,
     file_arg: &str,
 ) -> Result<(String, String, usize)> {
-    let mut cfg = paths.load_config().unwrap_or_default();
+    let mut allowed = paths.all_doc_paths();
     if let Ok(mut stmt) = conn.prepare("SELECT file_path FROM file_hashes WHERE file_path LIKE '/%'")
     {
         if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
             for fp in rows.flatten() {
                 if let Some(parent) = Path::new(&fp).parent() {
                     let pb = parent.to_path_buf();
-                    if !cfg.sources.contains(&pb) {
-                        cfg.sources.push(pb);
+                    if !allowed.contains(&pb) {
+                        allowed.push(pb);
                     }
                 }
             }
         }
     }
 
-    let resolved = resolve_file_with_sources(conn, &paths.project_root, &cfg.sources, file_arg)?;
+    let resolved = resolve_file_with_sources(conn, &paths.project_root, &allowed, file_arg)?;
     let raw_content = fs::read_to_string(&resolved)
         .with_context(|| format!("Failed to read file '{}'", resolved.display()))?;
     let raw_bytes = raw_content.len();
@@ -522,8 +523,8 @@ pub fn build_project_map(
 
     let prefix_filter = match subpath {
         Some(sp) if !sp.is_empty() && sp != "." => {
-            let cfg = paths.load_config().unwrap_or_default();
-            let resolved = validate_path(&paths.project_root, &cfg.sources, Path::new(sp))?;
+            let allowed = paths.all_doc_paths();
+            let resolved = validate_path(&paths.project_root, &allowed, Path::new(sp))?;
             Some(to_index_path(&paths.project_root, &resolved))
         }
         _ => None,
@@ -681,14 +682,18 @@ pub fn build_project_map(
         }
     }
 
-    if ext_file_count > 0 {
-        let cfg = paths.load_config().unwrap_or_default();
+    let ws_docs = paths.load_config().unwrap_or_default().docs;
+    let global_docs = paths.load_global_config().unwrap_or_default().docs;
+    if ext_file_count > 0 || !ws_docs.is_empty() || !global_docs.is_empty() {
         out.push_str(&format!(
-            "\n# External Sources ({} files, {} symbols/headings — query via `search_docs`, `smart_grep`, `outline`, or pass `subpath`)\n",
+            "\n# Registered Docs ({} external files, {} symbols/headings — query via `search_docs(doc=\"...\", scope=\"...\")`, `smart_grep`, `outline`, or `lee docs --json`)\n",
             ext_file_count, ext_symbol_count
         ));
-        for src in &cfg.sources {
-            out.push_str(&format!("- {}\n", src.display()));
+        for doc in &ws_docs {
+            out.push_str(&format!("- [workspace] {}: {}\n", doc.name, doc.path.display()));
+        }
+        for doc in &global_docs {
+            out.push_str(&format!("- [global] {}: {}\n", doc.name, doc.path.display()));
         }
     }
 
@@ -1109,7 +1114,7 @@ pub fn smart_grep_search(
         _ => None,
     };
 
-    let cfg = paths.load_config().unwrap_or_default();
+    let allowed_docs = paths.all_doc_paths();
     let mut local_files = Vec::new();
     let mut ext_files = Vec::new();
 
@@ -1122,7 +1127,7 @@ pub fn smart_grep_search(
                 if t.is_empty() {
                     continue;
                 }
-                if let Ok(valid) = validate_path(&paths.project_root, &cfg.sources, Path::new(t)) {
+                if let Ok(valid) = validate_path(&paths.project_root, &allowed_docs, Path::new(t)) {
                     if valid.exists() {
                         list.push(valid);
                     }
@@ -1193,7 +1198,7 @@ pub fn smart_grep_search(
         local_files.sort();
         local_files.dedup();
 
-        for src in &cfg.sources {
+        for src in &allowed_docs {
             if !src.exists() {
                 continue;
             }

@@ -2,7 +2,7 @@ pub mod embedder;
 pub mod fts;
 pub mod hybrid;
 
-use crate::config::AppPaths;
+use crate::config::{normalize_doc_name, AppPaths, DocEntry};
 use crate::db::{init_connection, now_unix};
 use crate::indexer::index_workspace;
 use crate::memory::embedder::{
@@ -10,7 +10,8 @@ use crate::memory::embedder::{
 };
 use crate::memory::fts::{search_doc_sections_fts, search_memories_fts};
 use crate::memory::hybrid::{apply_token_budget, cosine_similarity, reciprocal_rank_fusion};
-use anyhow::{Context, Result};
+use crate::security::to_index_path;
+use anyhow::{bail, Context, Result};
 use globset::GlobBuilder;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
@@ -594,16 +595,109 @@ struct DocSectionRecord {
     embedding: Option<Vec<f32>>,
 }
 
-/// Tool 4: `search_docs` — hybrid FTS5 BM25 + BGE-Small vector search across all `.md` sections in workspace & `sources`.
+fn path_matches_doc_key(file_path: &str, doc_key: &str) -> bool {
+    let key = doc_key.trim_end_matches('/');
+    if key.is_empty() {
+        return !file_path.starts_with('/');
+    }
+    file_path == key || file_path.starts_with(&format!("{key}/"))
+}
+
+fn match_named_docs<'a>(entries: &'a [DocEntry], query_name: &str) -> Vec<&'a DocEntry> {
+    let q_norm = normalize_doc_name(query_name);
+    if q_norm.is_empty() {
+        return Vec::new();
+    }
+    let exact: Vec<&DocEntry> = entries
+        .iter()
+        .filter(|e| normalize_doc_name(&e.name) == q_norm)
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    entries
+        .iter()
+        .filter(|e| normalize_doc_name(&e.name).contains(&q_norm))
+        .collect()
+}
+
+/// Tool 4: `search_docs` — hybrid FTS5 BM25 + BGE-Small vector search across `.md` sections in workspace & global docs.
 pub fn search_docs_hybrid(
     conn: &mut Connection,
     paths: &AppPaths,
     query: &str,
     file_filter: Option<&str>,
+    doc_name: Option<&str>,
+    scope: Option<&str>,
     budget_tokens: usize,
 ) -> Result<(String, usize)> {
-    // Lazily index workspace & registered external sources so `.md` sections are up to date
+    // Lazily index workspace & registered workspace/global docs so `.md` sections are up to date
     let _ = index_workspace(conn, paths, None)?;
+
+    let scope_mode = match scope.map(|s| s.trim().to_lowercase()).as_deref() {
+        None | Some("") | Some("all") => "all",
+        Some("workspace") | Some("w") | Some("local") | Some("project") => "workspace",
+        Some("global") | Some("g") => "global",
+        Some(other) => bail!("Invalid `scope` '{other}'. Expected 'workspace', 'global', or 'all'."),
+    };
+
+    let ws_docs = paths.load_config().unwrap_or_default().docs;
+    let global_docs = paths.load_global_config().unwrap_or_default().docs;
+
+    let doc_trim = doc_name.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let allowed_doc_keys: Option<Vec<String>> = if let Some(dname) = doc_trim {
+        let mut matched_paths = Vec::new();
+        if scope_mode != "global" {
+            for e in match_named_docs(&ws_docs, dname) {
+                matched_paths.push(to_index_path(&paths.project_root, &e.path));
+            }
+        }
+        if scope_mode != "workspace" {
+            for e in match_named_docs(&global_docs, dname) {
+                matched_paths.push(to_index_path(&paths.project_root, &e.path));
+            }
+        }
+        if matched_paths.is_empty() {
+            let mut avail = Vec::new();
+            for d in &ws_docs {
+                avail.push(format!("`{}` (workspace)", d.name));
+            }
+            for d in &global_docs {
+                avail.push(format!("`{}` (global)", d.name));
+            }
+            let avail_str = if avail.is_empty() {
+                "none registered (use `lee add-docs <path>`)".to_string()
+            } else {
+                avail.join(", ")
+            };
+            let msg = format!(
+                "No registered doc matched '{dname}' in scope '{scope_mode}'. Available docs: {avail_str}.\n"
+            );
+            return Ok((msg.clone(), msg.len()));
+        }
+        Some(matched_paths)
+    } else if scope_mode == "global" {
+        if global_docs.is_empty() {
+            let msg = "No global docs registered. Register one with `lee add-docs --g <path>`.\n"
+                .to_string();
+            return Ok((msg.clone(), msg.len()));
+        }
+        Some(
+            global_docs
+                .iter()
+                .map(|e| to_index_path(&paths.project_root, &e.path))
+                .collect(),
+        )
+    } else if scope_mode == "workspace" {
+        Some(
+            ws_docs
+                .iter()
+                .map(|e| to_index_path(&paths.project_root, &e.path))
+                .collect(),
+        )
+    } else {
+        None
+    };
 
     let filter_trim = file_filter.map(|s| s.trim()).filter(|s| !s.is_empty());
     let is_glob_pattern = filter_trim
@@ -627,6 +721,13 @@ pub fn search_docs_hybrid(
     };
 
     let matches_file = |fp: &str| -> bool {
+        if let Some(ref keys) = allowed_doc_keys {
+            let in_docs = keys.iter().any(|k| path_matches_doc_key(fp, k));
+            let in_workspace_local = doc_trim.is_none() && scope_mode == "workspace" && !fp.starts_with('/');
+            if !in_docs && !in_workspace_local {
+                return false;
+            }
+        }
         if let Some(ref matcher) = filter_glob {
             return matcher.is_match(fp);
         }

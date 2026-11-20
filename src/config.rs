@@ -10,11 +10,83 @@ pub const DB_FILE_NAME: &str = "lee.db";
 pub const GLOBAL_DB_FILE_NAME: &str = "global.db";
 pub const CONFIG_FILE_NAME: &str = "config.json";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocScope {
+    Workspace,
+    Global,
+}
+
+impl DocScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocScope::Workspace => "workspace",
+            DocScope::Global => "global",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DocEntry {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// Derives a clean default doc name from a file or directory path.
+pub fn default_doc_name(path: &Path) -> String {
+    path.file_stem()
+        .or_else(|| path.file_name())
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("docs")
+        .to_string()
+}
+
+/// Normalizes a doc name for flexible matching (case-insensitive, `-`/`_`/spaces collapsed).
+pub fn normalize_doc_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_space = true;
+    for ch in s.trim().chars() {
+        if ch.is_whitespace() || ch == '-' || ch == '_' {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+            last_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ProjectConfig {
-    /// Canonical paths to external documentation/reference folders registered via `add-source`
+    /// Named external documentation/code directories registered via `add-docs`
+    pub docs: Vec<DocEntry>,
+    /// Legacy unnamed paths from older `add-source` configs (migrated into `docs` on load)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<PathBuf>,
+}
+
+impl ProjectConfig {
+    fn normalize_legacy(&mut self) {
+        if self.sources.is_empty() {
+            return;
+        }
+        for path in std::mem::take(&mut self.sources) {
+            if !self.docs.iter().any(|d| d.path == path) {
+                let name = default_doc_name(&path);
+                self.docs.push(DocEntry { name, path });
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +98,7 @@ pub struct AppPaths {
     pub notes_dir: PathBuf,
     pub global_dir: PathBuf,
     pub global_db: PathBuf,
+    pub global_config_file: PathBuf,
     pub models_dir: PathBuf,
     pub vault_dir: PathBuf,
 }
@@ -59,6 +132,7 @@ impl AppPaths {
         };
 
         let global_db = global_dir.join(GLOBAL_DB_FILE_NAME);
+        let global_config_file = global_dir.join(CONFIG_FILE_NAME);
         let models_dir = global_dir.join("models");
         let vault_dir = global_dir.join("vault");
 
@@ -70,6 +144,7 @@ impl AppPaths {
             notes_dir,
             global_dir,
             global_db,
+            global_config_file,
             models_dir,
             vault_dir,
         })
@@ -164,61 +239,148 @@ impl AppPaths {
         Ok(())
     }
 
-    pub fn load_config(&self) -> Result<ProjectConfig> {
-        if !self.config_file.exists() {
+    fn load_config_at(path: &Path) -> Result<ProjectConfig> {
+        if !path.exists() {
             return Ok(ProjectConfig::default());
         }
-        let raw = fs::read_to_string(&self.config_file)
-            .with_context(|| format!("Failed to read {}", self.config_file.display()))?;
-        let cfg: ProjectConfig = serde_json::from_str(&raw)
-            .with_context(|| format!("Failed to parse {}", self.config_file.display()))?;
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let mut cfg: ProjectConfig = serde_json::from_str(&raw)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
+        cfg.normalize_legacy();
         Ok(cfg)
     }
 
-    pub fn save_config(&self, cfg: &ProjectConfig) -> Result<()> {
-        fs::create_dir_all(&self.local_dir)?;
+    fn save_config_at(path: &Path, cfg: &ProjectConfig) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let json = serde_json::to_string_pretty(cfg)?;
-        fs::write(&self.config_file, json)
-            .with_context(|| format!("Failed to write {}", self.config_file.display()))?;
+        fs::write(path, json)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
     }
 
-    pub fn add_source(&self, source_path: &Path) -> Result<PathBuf> {
-        let canonical = fs::canonicalize(source_path)
-            .with_context(|| format!("Source path does not exist: {}", source_path.display()))?;
-        let mut cfg = self.load_config()?;
-        if !cfg.sources.contains(&canonical) {
-            cfg.sources.push(canonical.clone());
-            self.save_config(&cfg)?;
-        }
-        Ok(canonical)
+    pub fn load_config(&self) -> Result<ProjectConfig> {
+        Self::load_config_at(&self.config_file)
     }
 
-    pub fn remove_source(&self, source_path: &Path) -> Result<Option<PathBuf>> {
-        let canonical = fs::canonicalize(source_path).unwrap_or_else(|_| source_path.to_path_buf());
-        let raw_str = source_path.to_string_lossy();
-        let mut cfg = self.load_config()?;
-        let before = cfg.sources.len();
-        let mut removed_path = None;
-        cfg.sources.retain(|p| {
-            let match_it = p == &canonical
-                || p == source_path
-                || p.to_string_lossy().trim_end_matches('/') == raw_str.trim_end_matches('/');
-            if match_it && removed_path.is_none() {
-                removed_path = Some(p.clone());
+    pub fn save_config(&self, cfg: &ProjectConfig) -> Result<()> {
+        Self::save_config_at(&self.config_file, cfg)
+    }
+
+    pub fn load_global_config(&self) -> Result<ProjectConfig> {
+        Self::load_config_at(&self.global_config_file)
+    }
+
+    pub fn save_global_config(&self, cfg: &ProjectConfig) -> Result<()> {
+        Self::save_config_at(&self.global_config_file, cfg)
+    }
+
+    pub fn load_docs(&self, scope: DocScope) -> Result<Vec<DocEntry>> {
+        match scope {
+            DocScope::Workspace => Ok(self.load_config()?.docs),
+            DocScope::Global => Ok(self.load_global_config()?.docs),
+        }
+    }
+
+    /// Returns all registered doc paths (workspace + global, deduplicated).
+    pub fn all_doc_paths(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for cfg in [
+            self.load_config().unwrap_or_default(),
+            self.load_global_config().unwrap_or_default(),
+        ] {
+            for entry in cfg.docs {
+                if !out.contains(&entry.path) {
+                    out.push(entry.path);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn add_doc(&self, scope: DocScope, source_path: &Path, name: &str) -> Result<DocEntry> {
+        let canonical = fs::canonicalize(source_path)
+            .with_context(|| format!("Docs path does not exist: {}", source_path.display()))?;
+        let final_name = {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                default_doc_name(&canonical)
+            } else {
+                trimmed.to_string()
+            }
+        };
+
+        let mut cfg = match scope {
+            DocScope::Workspace => self.load_config()?,
+            DocScope::Global => self.load_global_config()?,
+        };
+
+        let entry = DocEntry {
+            name: final_name,
+            path: canonical.clone(),
+        };
+
+        if let Some(existing) = cfg.docs.iter_mut().find(|d| d.path == canonical) {
+            existing.name = entry.name.clone();
+        } else {
+            cfg.docs.push(entry.clone());
+        }
+
+        match scope {
+            DocScope::Workspace => self.save_config(&cfg)?,
+            DocScope::Global => self.save_global_config(&cfg)?,
+        }
+        Ok(entry)
+    }
+
+    pub fn remove_doc(&self, scope: DocScope, target: &str) -> Result<Option<DocEntry>> {
+        let target_trimmed = target.trim();
+        let target_norm = normalize_doc_name(target_trimmed);
+        let target_path = Path::new(target_trimmed);
+        let canonical = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+
+        let mut cfg = match scope {
+            DocScope::Workspace => self.load_config()?,
+            DocScope::Global => self.load_global_config()?,
+        };
+
+        let before = cfg.docs.len();
+        let mut removed = None;
+        cfg.docs.retain(|d| {
+            let match_it = removed.is_none()
+                && (d.path == canonical
+                    || d.path == target_path
+                    || d.path.to_string_lossy().trim_end_matches('/')
+                        == target_trimmed.trim_end_matches('/')
+                    || d.name.eq_ignore_ascii_case(target_trimmed)
+                    || (!target_norm.is_empty() && normalize_doc_name(&d.name) == target_norm));
+            if match_it {
+                removed = Some(d.clone());
             }
             !match_it
         });
-        if cfg.sources.len() != before {
-            self.save_config(&cfg)?;
+
+        if cfg.docs.len() != before {
+            match scope {
+                DocScope::Workspace => self.save_config(&cfg)?,
+                DocScope::Global => self.save_global_config(&cfg)?,
+            }
         }
-        Ok(removed_path)
+        Ok(removed)
     }
 
-    pub fn clear_sources(&self) -> Result<Vec<PathBuf>> {
-        let mut cfg = self.load_config()?;
-        let removed = std::mem::take(&mut cfg.sources);
-        self.save_config(&cfg)?;
+    pub fn clear_docs(&self, scope: DocScope) -> Result<Vec<DocEntry>> {
+        let mut cfg = match scope {
+            DocScope::Workspace => self.load_config()?,
+            DocScope::Global => self.load_global_config()?,
+        };
+        let removed = std::mem::take(&mut cfg.docs);
+        match scope {
+            DocScope::Workspace => self.save_config(&cfg)?,
+            DocScope::Global => self.save_global_config(&cfg)?,
+        }
         Ok(removed)
     }
 }
@@ -240,6 +402,49 @@ mod tests {
 
         assert!(paths.notes_dir.join("rule.md").exists());
         assert!(!temp.join(".notes").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_named_workspace_global_docs_and_legacy_sources_migration() {
+        let temp = std::env::temp_dir().join(format!("lee_docs_cfg_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let ws_doc = temp.join("gpui-kit_docs");
+        let gl_doc = temp.join("rust_guide");
+        let legacy_doc = temp.join("legacy_ref");
+        fs::create_dir_all(&ws_doc).unwrap();
+        fs::create_dir_all(&gl_doc).unwrap();
+        fs::create_dir_all(&legacy_doc).unwrap();
+
+        let mut paths = AppPaths::from_root(temp.join("repo")).unwrap();
+        fs::create_dir_all(&paths.local_dir).unwrap();
+        paths.global_dir = temp.join("global_cfg");
+        paths.global_config_file = paths.global_dir.join(CONFIG_FILE_NAME);
+
+        // Legacy config with `"sources"` migrates cleanly into `docs`
+        fs::write(
+            &paths.config_file,
+            serde_json::json!({ "sources": [legacy_doc] }).to_string(),
+        )
+        .unwrap();
+        let migrated = paths.load_config().unwrap();
+        assert_eq!(migrated.docs.len(), 1);
+        assert_eq!(migrated.docs[0].name, "legacy_ref");
+        assert!(migrated.sources.is_empty());
+
+        // Add workspace & global named docs
+        let e1 = paths.add_doc(DocScope::Workspace, &ws_doc, "gpui kit").unwrap();
+        assert_eq!(e1.name, "gpui kit");
+        let e2 = paths.add_doc(DocScope::Global, &gl_doc, "rust guide").unwrap();
+        assert_eq!(e2.name, "rust guide");
+        assert_eq!(paths.all_doc_paths().len(), 3);
+
+        // Remove by normalized name
+        let removed = paths.remove_doc(DocScope::Workspace, "gpui-kit").unwrap();
+        assert_eq!(removed.unwrap().name, "gpui kit");
+        assert_eq!(paths.load_docs(DocScope::Workspace).unwrap().len(), 1);
+        assert_eq!(paths.load_docs(DocScope::Global).unwrap().len(), 1);
 
         let _ = fs::remove_dir_all(&temp);
     }

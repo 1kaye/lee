@@ -116,11 +116,13 @@ pub fn mcp_tools_list() -> Value {
             },
             {
                 "name": "search_docs",
-                "description": "Hybrid FTS5 BM25 + BGE-Small (RRF) search over project & external `sources` .md files.",
+                "description": "Hybrid FTS5 BM25 + BGE-Small (RRF) search over workspace & global registered docs (.md files).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Topic, API, or concept to search in docs." },
+                        "doc": { "type": "string", "description": "Optional registered doc name (e.g. 'gpui kit') from `lee docs --json`." },
+                        "scope": { "type": "string", "description": "Optional scope: 'workspace', 'global', or 'all' (default: 'all').", "default": "all" },
                         "file_filter": { "type": "string", "description": "Optional substring or glob filter." },
                         "budget_tokens": { "type": "integer", "description": "Max token budget (default: 800).", "default": 800 }
                     },

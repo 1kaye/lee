@@ -12,8 +12,8 @@ AI coding agents routinely burn tens of thousands of tokens reading entire sourc
 
 1. **Pillar 1 — Precision Code AST, Config & Markdown Section Index (`tree-sitter` + Markdown State-Machine + `blake3` Lazy Indexing):**
    Extracts symbol signatures (`fn`, `struct`, `enum`, `trait`, `impl`, `interface`, `class`, `type`, `mod`, `const`, `macro`) for Rust, TypeScript/JS, Svelte (`<script>` with `line_offset`), Python, and Go; key/table ranges for `.toml`, `.yml`/`.yaml`, and `.json`; and `#`–`####` headings for `.md`/`.mdx` (fence-aware so `#` comments inside ```` ``` ```` / `~~~` code blocks are ignored). Files are only re-parsed when their `blake3` hash changes.
-2. **Pillar 2 — Hybrid Documentation & External Source Search (`doc_sections` SQLite FTS5 BM25 + `BAAI/bge-small-en-v1.5`):**
-   Splits Markdown files across both the workspace and external `sources` (registered via `lee add-source`, which supports both code and `.md` libraries) into coalesced & overlapping window chunks, indexing them with SQLite FTS5 (multi-term AND-boosted BM25) and 384-dim `BGESmallENV15Q` vectors (with **CUDA** GPU acceleration and automatic CPU fallback).
+2. **Pillar 2 — Hybrid Documentation & External Docs Search (`doc_sections` SQLite FTS5 BM25 + `BAAI/bge-small-en-v1.5`):**
+   Splits Markdown files across the workspace and named workspace/global docs (registered via `lee add-docs`, supporting both code and `.md` libraries) into coalesced & overlapping window chunks, indexing them with SQLite FTS5 (multi-term AND-boosted BM25) and 384-dim `BGESmallENV15Q` vectors (with **CUDA** GPU acceleration and automatic CPU fallback). Target specific named docs or scopes directly via `search_docs(query="...", doc="gpui kit", scope="global"|"workspace")`.
 3. **Pillar 3 — Output Digest & Handle Store (`h:ID` + ANSI Strip & Never-Worse Guard):**
    Executes shell/build/test/diff commands (`cargo`, `nextest`, `vitest`, `jest`, `tsc`, `pytest`, `go test`, `kaye diff`, `git diff`) through `run_digest`. ANSI escape sequences are stripped, compact output never exceeds raw size (*never-worse* invariant), and outputs > 35 lines are saved to SQLite under a short handle (`h:<6-char-blake3>`). Specific failing tests or per-file diffs can be retrieved via `recall(key="h:ID", item="NAME")`.
 4. **Pillar 4 — Two-Layer Memory, `[[wikilinks]]`, Handoff & Backlog (`SQLite FTS5 BM25` + `BGESmallENV15Q` via RRF):**
@@ -31,7 +31,7 @@ flowchart TD
 
     subgraph Pillars["Four Pillars of Token Savings"]
         Indexer["Pillar 1: AST, Config & Markdown Indexer\n(tree-sitter + .md Fence State-Machine + blake3)"]
-        DocSearch["Pillar 2: Hybrid Doc & External Source Search\n(Workspace + External sources Code & .md)"]
+        DocSearch["Pillar 2: Hybrid Named Docs Search\n(Workspace & Global Docs Code & .md)"]
         Digest["Pillar 3: Command & Diff Digest Engine\n(Cargo / Vitest / Jest / TSC / Pytest / Go / Diff)"]
         Memory["Pillar 4: Two-Layer Hybrid Memory\n(Project .lee/.notes/ + Global ~/.config/lee/vault/)"]
     end
@@ -90,19 +90,30 @@ lee init --skip-model
 ```
 *(Note: `lee init` automatically installs the Antigravity `PreToolUse` hook plugin and keeps `.agents/plugins/lee/rules/AGENTS.md`, `~/.config/lee/AGENTS.md`, and any `<!-- lee:start -->...<!-- lee:end -->` block inside `./AGENTS.md` or `./CLAUDE.md` up to date whenever `lee` is upgraded to a new version.)*
 
-### C. Manage External Reference Sources (`add-source` & `rm-source`)
-Register external reference libraries or documentation folders (both source code `.rs`/`.ts`/`.py`/`.go` and `.md` docs) for read-only indexing:
+### C. Manage Workspace & Global Docs (`add-docs`, `docs` & `rm-docs`)
+Register named external reference libraries or documentation folders (both source code `.rs`/`.ts`/`.py`/`.go` and `.md` docs) for the current workspace (`--w`, default) or globally across all workspaces (`--g`):
 ```bash
-# Register an external code/docs directory:
-lee add-source /home/user/Projects/lib-docs
+# Register a workspace doc (prompts interactively for a name, e.g. "gpui kit"):
+lee add-docs /home/user/Projects/gpui-kit_docs
+lee add-docs --w /home/user/Projects/gpui-kit_docs
 
-# Remove a source via interactive numbered menu:
-lee rm-source
+# Register a global doc (available in every workspace) or pass --name directly:
+lee add-docs --g /home/user/Projects/gpui-kit_docs
+lee add-docs --g /home/user/Projects/gpui-kit_docs --name "gpui kit"
 
-# Remove by index number, path, or --all:
-lee rm-source 1
-lee rm-source --all
+# List all registered workspace and global docs (with names & paths):
+lee docs
+
+# Machine-readable JSON output for LLMs and scripts:
+lee docs --json
+
+# Remove a doc via interactive numbered menu (or by name, number, path, or --all):
+lee rm-docs
+lee rm-docs "gpui kit" --g
+lee rm-docs 1
+lee rm-docs --w --all
 ```
+Once registered, you can mention docs by name in prompts (e.g. *"cek docs gpui kit"*, *"cek docs gpui kit dari global"*, or *"cek docs gpui kit di workspace ini"*) and the agent will resolve them via `lee docs --json` and `search_docs(query="...", doc="gpui kit", scope="global"|"workspace")`.
 
 ### D. MCP Configuration for Antigravity CLI (`agy`)
 Add `lee` to your global Antigravity configuration at `~/.gemini/config/mcp_config.json`:
@@ -145,7 +156,7 @@ Add to `.mcp.json` in your project root or `~/.claude.json`:
 | 2 | `outline` | `file`, `max_tokens?`, `include_tests?` | Complete symbol table (code), `#` Heading TOC (`.md`), or config key ranges (`.yml`/`.toml`/`.json`) for one file. |
 | 3 | `read_symbol` | `file?`, `symbol?`, `start_line?`, `end_line?`, `context_lines?`, `strip_comments?`, `signatures_only?`, `max_lines?` | Precision line-range reader for symbols (across workspace if `file` omitted), Markdown sections, or config keys with pagination, comment stripping, & AST `signatures_only` mode. |
 | 4 | `find_references` | `symbol` | Queries AST `symbol_refs` (`call`, `type_use`, `import`) to list every caller function and file referencing a symbol across the workspace. |
-| 5 | `search_docs` | `query`, `file_filter?`, `budget_tokens?` (def: `800`) | Hybrid search (FTS5 BM25 + `BGESmallENV15Q` RRF) across project & external `sources` Markdown sections. |
+| 5 | `search_docs` | `query`, `doc?`, `scope?` (`"workspace"` / `"global"` / `"all"`), `file_filter?`, `budget_tokens?` (def: `800`) | Hybrid search (FTS5 BM25 + `BGESmallENV15Q` RRF) across workspace & global named docs Markdown sections. |
 | 6 | `smart_grep` | `pattern`, `path?`, `glob?`, `files_only?`, `case_insensitive?`, `max_per_file?`, `max_results?` | Replaces `rg -l` / `rg -n`: file-grouped regex matches (with directory prefix folding on `files_only=true`) annotated with enclosing AST symbols or Markdown headings. |
 | 7 | `run_digest` | `command`, `cwd?` | Runs shell/build/test/diff commands; groups `cargo clippy` rules, compacts `git status`/`git log`, respects `--nocapture`, enforces *never-worse*, and saves logs > 35 lines under `h:ID`. |
 | 8 | `recall` | `key`, `item?`, `failures_only?`, `filter?`, `start_line?`, `end_line?` | Pulls a single test/symbol/file-diff block (`item`), failure blocks, regex-filtered context, or line ranges from `h:ID`. |
@@ -155,12 +166,13 @@ Add to `.mcp.json` in your project root or `~/.claude.json`:
 ### CLI Commands (`lee`)
 
 ```bash
-lee init [--global] [--skip-model]             # Initialize .lee/, PreToolUse hook, SQLite DB, & BGE-Small model
-lee exec <COMMAND...>                          # Execute a shell command and compress its output via run_digest
-lee add-source <PATH>                          # Register an external code/docs directory for read-only indexing
-lee rm-source [PATH|NUMBER|--all]              # Remove an external source (supports interactive numbered menu)
-lee index                                      # Scan & pre-index all code, config, and Markdown files (+ BGE vectors) in parallel
-lee status                                     # Show index counts, BGE model cache status, and registered external sources
+lee init [--global] [--skip-model]               # Initialize .lee/, PreToolUse hook, SQLite DB, & BGE-Small model
+lee exec <COMMAND...>                            # Execute a shell command and compress its output via run_digest
+lee docs [--json]                                # List registered workspace & global docs (`--json` for LLMs)
+lee add-docs <PATH> [--w|--g] [--name <NAME>]    # Register a named workspace (`--w`) or global (`--g`) docs dir
+lee rm-docs [NAME|PATH|NUM|--all] [--w|--g]      # Remove a registered doc (supports interactive numbered menu)
+lee index                                        # Scan & pre-index all code, config, and Markdown files (+ BGE vectors) in parallel
+lee status                                       # Show index counts, BGE model cache status, and registered docs
 lee stats [--daily] [--history]                # Display token-savings audit table, daily ASCII chart, and call history
 lee discover [PATH]                            # Scan AI session transcripts (.jsonl) for bypassed raw commands & missed savings
 lee backlog                                    # List latest Session Handoffs and aging Work Backlog items
