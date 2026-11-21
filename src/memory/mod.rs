@@ -20,8 +20,6 @@ pub struct MemoryRecord {
     pub topic: String,
     pub tags: String,
     pub content: String,
-    pub md_path: Option<String>,
-    pub created_at: i64,
 }
 
 /// Selects formatted blocks within `budget_tokens` (1 token ≈ 4 bytes).
@@ -46,9 +44,9 @@ fn apply_token_budget(blocks: &[String], budget_tokens: usize) -> String {
     out
 }
 
-/// Tool 8: `remember` — appends a decision/rule, session handoff, or backlog item to Markdown
-/// (`.notes/` for `project`/`handoff`/`backlog` or `~/.config/lee/vault/` for `global`),
-/// maintains Obsidian-compatible `[[wikilinks]]` and `.notes/INDEX.md`, and indexes into SQLite FTS5.
+/// Tool 9: `remember` — appends a decision/rule, session handoff, or backlog item to Markdown
+/// (`.notes/` for `project`/`handoff`/`backlog` or `~/.config/lee/vault/` for `global`)
+/// with Obsidian-compatible `[[wikilinks]]`, and indexes into SQLite FTS5.
 pub fn store_memory(
     project_conn: &Connection,
     paths: &AppPaths,
@@ -112,90 +110,28 @@ pub fn store_memory(
     }
 
     let md_path_str = md_file.to_string_lossy().to_string();
-
-    if scope_norm == "global" {
-        let global_conn = init_connection(&paths.global_db)?;
-        global_conn.execute(
-            "INSERT INTO memories_meta (scope, topic, tags, content, md_path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![scope_norm, topic, tags_str, content.trim(), &md_path_str, ts],
-        )?;
+    let target_conn;
+    let conn_ref = if scope_norm == "global" {
+        target_conn = init_connection(&paths.global_db)?;
+        &target_conn
     } else {
-        project_conn.execute(
-            "INSERT INTO memories_meta (scope, topic, tags, content, md_path, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![scope_norm, topic, tags_str, content.trim(), &md_path_str, ts],
-        )?;
-        let _ = update_generated_notes_index(project_conn, &paths.notes_dir);
-    }
+        project_conn
+    };
+    conn_ref.execute(
+        "INSERT INTO memories_meta (scope, topic, tags, content, md_path, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![scope_norm, topic, tags_str, content.trim(), &md_path_str, ts],
+    )?;
 
     let out = format!(
         "Saved memory [{scope_norm}] '[[{slug}|{topic}]]' (tags: [{tags_str}]) -> {}\n",
         md_file.display()
     );
-    let raw_bytes = content.len().max(out.len());
-    Ok((out, raw_bytes))
-}
-
-/// Regenerates `.notes/INDEX.md` between `<!-- lee-index:start -->` and `<!-- lee-index:end -->` markers
-/// using standard Obsidian-compatible `[[wikilinks]]`.
-pub fn update_generated_notes_index(conn: &Connection, notes_dir: &Path) -> Result<()> {
-    fs::create_dir_all(notes_dir)?;
-    let mut stmt = conn.prepare(
-        "SELECT scope, topic, tags, created_at
-         FROM memories_meta
-         ORDER BY created_at DESC",
-    )?;
-    let rows: Vec<(String, String, String, i64)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let mut block = String::from("<!-- lee-index:start -->\n# Lee Vault Index\n\n");
-    let mut seen = HashSet::new();
-    for (scope, topic, tags, _ts) in rows {
-        let slug = match scope.as_str() {
-            "handoff" => "handoff".to_string(),
-            "backlog" => "backlog".to_string(),
-            _ => slugify(&topic),
-        };
-        let key = format!("{scope}:{topic}");
-        if !seen.insert(key) {
-            continue;
-        }
-        block.push_str(&format!(
-            "- [[{slug}|{topic}]] (`{scope}`{}) \n",
-            if tags.is_empty() {
-                String::new()
-            } else {
-                format!(" — tags: `{tags}`")
-            }
-        ));
-    }
-    block.push_str("<!-- lee-index:end -->\n");
-
-    let index_path = notes_dir.join("INDEX.md");
-    if index_path.exists() {
-        let existing = fs::read_to_string(&index_path).unwrap_or_default();
-        if let (Some(st), Some(en)) = (
-            existing.find("<!-- lee-index:start -->"),
-            existing.find("<!-- lee-index:end -->"),
-        ) {
-            let end_pos = en + "<!-- lee-index:end -->".len();
-            let mut updated = String::new();
-            updated.push_str(&existing[..st]);
-            updated.push_str(block.trim_end());
-            updated.push_str(&existing[end_pos..]);
-            fs::write(&index_path, updated)?;
-            return Ok(());
-        }
-    }
-    fs::write(&index_path, block)?;
-    Ok(())
+    Ok((out.clone(), content.len().max(out.len())))
 }
 
 /// Parses YAML frontmatter (`topic`, `tags`, `scope`, `created_at`) and strips the leading `# Title`
-/// from a `.notes/*.md` file so synced notes stay clean without raw frontmatter noise.
+/// from a `.notes/*.md` file so synced notes stay clean.
 fn parse_note_markdown(raw: &str, default_topic: &str, default_scope: &str) -> (String, String, String, i64, String) {
     let mut topic = default_topic.to_string();
     let mut tags = String::new();
@@ -237,11 +173,8 @@ fn parse_note_markdown(raw: &str, default_topic: &str, default_scope: &str) -> (
     (topic, tags, scope, created_at, body.trim().to_string())
 }
 
-/// Syncs `.md` files in `.notes/` or `vault/` (excluding `INDEX.md`) with `memories_meta`,
-/// pruning any DB rows whose backing `.md` file was deleted or rolled back, and healing any
-/// legacy unparsed frontmatter rows.
+/// Syncs `.md` files in `.notes/` or `vault/` (excluding `INDEX.md`) with `memories_meta`.
 fn sync_notes_dir_to_db(conn: &Connection, dir: &Path, scope: &str) -> Result<()> {
-    // 1. Prune stale DB entries whose backing .md file no longer exists on disk, or heal raw frontmatter rows
     if let Ok(mut stmt) = conn.prepare("SELECT id, md_path, content FROM memories_meta WHERE md_path IS NOT NULL") {
         let existing_rows: Vec<(i64, String, String)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -250,15 +183,10 @@ fn sync_notes_dir_to_db(conn: &Connection, dir: &Path, scope: &str) -> Result<()
             .flatten()
             .filter_map(|r| r.ok())
             .collect();
-        let mut pruned = false;
         for (id, md_path, content) in existing_rows {
             if !Path::new(&md_path).exists() || content.starts_with("---\ntopic:") {
                 let _ = conn.execute("DELETE FROM memories_meta WHERE id = ?1", params![id]);
-                pruned = true;
             }
-        }
-        if pruned && scope != "global" {
-            let _ = update_generated_notes_index(conn, dir);
         }
     }
 
@@ -270,10 +198,9 @@ fn sync_notes_dir_to_db(conn: &Connection, dir: &Path, scope: &str) -> Result<()
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        if path.file_name().and_then(|n| n.to_str()) == Some("INDEX.md") {
+        if path.extension().and_then(|e| e.to_str()) != Some("md")
+            || path.file_name().and_then(|n| n.to_str()) == Some("INDEX.md")
+        {
             continue;
         }
         let path_str = path.to_string_lossy().to_string();
@@ -326,7 +253,7 @@ pub fn extract_wikilinks(text: &str) -> Vec<String> {
     links
 }
 
-/// Tool 9: `recall_memory` — FTS5 BM25 search across Project `.notes/` (including `handoff` & `backlog`)
+/// Tool 10: `recall_memory` — column-weighted FTS5 BM25 search across Project `.notes/`
 /// and Global `vault/`, with 1-hop Obsidian `[[wikilinks]]` expansion.
 pub fn recall_memories(
     project_conn: &Connection,
@@ -338,19 +265,10 @@ pub fn recall_memories(
 
     let mut matched_keys: Vec<(String, i64)> = Vec::new();
     let mut records_map: HashMap<(String, i64), MemoryRecord> = HashMap::new();
-    let mut total_raw_bytes = 0usize;
 
-    // 1. Collect from Project DB
-    collect_db_memories(
-        project_conn,
-        "project",
-        query,
-        &mut matched_keys,
-        &mut records_map,
-        &mut total_raw_bytes,
-    )?;
+    collect_db_memories(project_conn, "project", query, &mut matched_keys, &mut records_map)?;
 
-    // 2. Collect from Global DB if initialized
+    let mut global_conn_opt = None;
     if paths.global_db.exists() || paths.vault_dir.exists() {
         let _ = paths.ensure_global_dirs();
         if let Ok(global_conn) = init_connection(&paths.global_db) {
@@ -361,14 +279,30 @@ pub fn recall_memories(
                 query,
                 &mut matched_keys,
                 &mut records_map,
-                &mut total_raw_bytes,
             );
+            global_conn_opt = Some(global_conn);
         }
     }
 
     if matched_keys.is_empty() {
         let msg = format!("No relevant project or global memories found for query: '{query}'.\n");
-        return Ok((msg.clone(), total_raw_bytes.max(msg.len())));
+        return Ok((msg.clone(), msg.len()));
+    }
+
+    // Load 1-hop wikilink targets on demand only when matched records actually contain [[wikilinks]]
+    let mut needed_slugs: HashSet<String> = HashSet::new();
+    for key in &matched_keys {
+        if let Some(rec) = records_map.get(key) {
+            for wl in extract_wikilinks(&rec.content) {
+                needed_slugs.insert(wl);
+            }
+        }
+    }
+    if !needed_slugs.is_empty() {
+        load_linked_memories(project_conn, "project", &needed_slugs, &mut records_map);
+        if let Some(ref gconn) = global_conn_opt {
+            load_linked_memories(gconn, "global", &needed_slugs, &mut records_map);
+        }
     }
 
     let mut formatted_blocks = Vec::new();
@@ -381,16 +315,14 @@ pub fn recall_memories(
         if let Some(rec) = records_map.get(key) {
             included_keys.insert(key.clone());
             let slug = slugify(&rec.topic);
-            let block = format!(
+            formatted_blocks.push(format!(
                 "- **[{scope}] [[{slug}|{topic}]]** (tags: `{tags}`)\n  {content}\n",
                 scope = rec.scope,
                 topic = rec.topic,
                 tags = rec.tags,
                 content = rec.content.replace('\n', "\n  ")
-            );
-            formatted_blocks.push(block);
+            ));
 
-            // 1-hop [[wikilink]] resolution: surface linked notes automatically
             let wikilinks = extract_wikilinks(&rec.content);
             if !wikilinks.is_empty() {
                 for (cand_key, cand_rec) in &records_map {
@@ -414,68 +346,7 @@ pub fn recall_memories(
 
     let body = apply_token_budget(&formatted_blocks, budget_tokens);
     let out = format!("# Recalled Memories (query: `{query}`)\n{body}");
-    Ok((out.clone(), total_raw_bytes.max(out.len())))
-}
-
-/// Formats active Session Handoffs and aging Backlog work items (`lee backlog`).
-pub fn list_backlog_and_handoff(conn: &Connection) -> Result<String> {
-    let mut out = String::new();
-
-    // Latest handoff
-    let mut h_stmt = conn.prepare(
-        "SELECT topic, tags, content, created_at
-         FROM memories_meta
-         WHERE scope = 'handoff'
-         ORDER BY created_at DESC, id DESC
-         LIMIT 3",
-    )?;
-    let handoffs: Vec<(String, String, String, i64)> = h_stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    out.push_str("=== Session Handoff (Latest First) ===\n");
-    if handoffs.is_empty() {
-        out.push_str("(No session handoffs recorded. Use `remember` with `scope=\"handoff\"`.)\n");
-    } else {
-        for (topic, tags, content, ts) in handoffs {
-            out.push_str(&format!(
-                "- [ts:{ts}] **{topic}** (`{tags}`)\n  {}\n",
-                content.replace('\n', "\n  ")
-            ));
-        }
-    }
-
-    // Aging backlog items (oldest items first)
-    let mut b_stmt = conn.prepare(
-        "SELECT id, topic, tags, content, created_at
-         FROM memories_meta
-         WHERE scope = 'backlog' OR LOWER(tags) LIKE '%backlog%' OR LOWER(tags) LIKE '%todo%'
-         ORDER BY created_at ASC, id ASC",
-    )?;
-    let backlogs: Vec<(i64, String, String, String, i64)> = b_stmt
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    out.push_str("\n=== Work Backlog Queue (Aging Items First) ===\n");
-    if backlogs.is_empty() {
-        out.push_str("(No backlog items queued. Use `remember` with `scope=\"backlog\"`.)\n");
-    } else {
-        for (idx, (_id, topic, tags, content, ts)) in backlogs.iter().enumerate() {
-            out.push_str(&format!(
-                "{}. [[{}|{}]] (tags: `{tags}`, created: {ts})\n   {}\n",
-                idx + 1,
-                slugify(topic),
-                topic,
-                content.replace('\n', "\n   ")
-            ));
-        }
-    }
-
-    Ok(out)
+    Ok((out.clone(), out.len()))
 }
 
 fn collect_db_memories(
@@ -484,49 +355,85 @@ fn collect_db_memories(
     query: &str,
     fts_keys: &mut Vec<(String, i64)>,
     records_map: &mut HashMap<(String, i64), MemoryRecord>,
-    total_raw_bytes: &mut usize,
 ) -> Result<()> {
-    if let Ok(fts_ids) = search_memories_fts(conn, query, 30) {
+    let fts_ids = search_memories_fts(conn, query, 25).unwrap_or_default();
+    if !fts_ids.is_empty()
+        && let Ok(mut by_id) =
+            conn.prepare("SELECT id, scope, topic, tags, content FROM memories_meta WHERE id = ?1")
+    {
         for id in fts_ids {
-            fts_keys.push((scope_prefix.to_string(), id));
+            if let Ok(rec) = by_id.query_row(params![id], |r| {
+                Ok(MemoryRecord {
+                    id: r.get(0)?,
+                    scope: r.get(1)?,
+                    topic: r.get(2)?,
+                    tags: r.get(3)?,
+                    content: r.get(4)?,
+                })
+            }) {
+                let key = (scope_prefix.to_string(), rec.id);
+                if !fts_keys.contains(&key) {
+                    fts_keys.push(key.clone());
+                }
+                records_map.insert(key, rec);
+            }
         }
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT id, scope, topic, tags, content, md_path, created_at
-         FROM memories_meta",
-    )?;
-    let rows = stmt.query_map([], |r| {
+    // Targeted SQL LIKE fallback only when FTS5 returned fewer than 5 results
+    if fts_keys.len() < 5 {
+        let like_pat = format!("%{}%", query.trim().to_lowercase());
+        let mut stmt = conn.prepare(
+            "SELECT id, scope, topic, tags, content FROM memories_meta
+             WHERE LOWER(topic) LIKE ?1 OR LOWER(tags) LIKE ?1 OR LOWER(scope) LIKE ?1 OR LOWER(content) LIKE ?1
+             ORDER BY created_at DESC LIMIT 20",
+        )?;
+        let rows = stmt.query_map(params![like_pat], |r| {
+            Ok(MemoryRecord {
+                id: r.get(0)?,
+                scope: r.get(1)?,
+                topic: r.get(2)?,
+                tags: r.get(3)?,
+                content: r.get(4)?,
+            })
+        })?;
+        for row in rows.flatten() {
+            let key = (scope_prefix.to_string(), row.id);
+            if !fts_keys.contains(&key) {
+                fts_keys.push(key.clone());
+            }
+            records_map.insert(key, row);
+        }
+    }
+
+    Ok(())
+}
+
+fn load_linked_memories(
+    conn: &Connection,
+    scope_prefix: &str,
+    needed_slugs: &HashSet<String>,
+    records_map: &mut HashMap<(String, i64), MemoryRecord>,
+) {
+    let Ok(mut stmt) = conn.prepare("SELECT id, scope, topic, tags, content FROM memories_meta") else {
+        return;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
         Ok(MemoryRecord {
             id: r.get(0)?,
             scope: r.get(1)?,
             topic: r.get(2)?,
             tags: r.get(3)?,
             content: r.get(4)?,
-            md_path: r.get(5)?,
-            created_at: r.get(6)?,
         })
-    })?;
-
-    let q_lower = query.to_lowercase();
-    for row in rows.flatten() {
-        *total_raw_bytes += row.content.len() + row.topic.len();
-        let key = (scope_prefix.to_string(), row.id);
-
-        // Substring fallback if FTS5 tokenizer missed exact symbol/punctuation or scope match
-        if !fts_keys.contains(&key)
-            && (row.topic.to_lowercase().contains(&q_lower)
-                || row.tags.to_lowercase().contains(&q_lower)
-                || row.scope.to_lowercase().contains(&q_lower)
-                || row.content.to_lowercase().contains(&q_lower))
-        {
-            fts_keys.push(key.clone());
+    }) else {
+        return;
+    };
+    for rec in rows.flatten() {
+        if needed_slugs.contains(&slugify(&rec.topic)) {
+            records_map.entry((scope_prefix.to_string(), rec.id)).or_insert(rec);
         }
-
-        records_map.insert(key, row);
     }
-
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -565,7 +472,8 @@ fn match_named_docs<'a>(entries: &'a [DocEntry], query_name: &str) -> Vec<&'a Do
         .collect()
 }
 
-/// Tool 4: `search_docs` — SQLite FTS5 BM25 search across `.md`/`.mdx` sections in workspace & global docs.
+/// Tool 5: `search_docs` — column-weighted SQLite FTS5 BM25 search across `.md`/`.mdx` sections
+/// and full code files in workspace & global docs (no full-table scan).
 pub fn search_docs(
     conn: &mut Connection,
     paths: &AppPaths,
@@ -575,7 +483,6 @@ pub fn search_docs(
     scope: Option<&str>,
     budget_tokens: usize,
 ) -> Result<(String, usize)> {
-    // Lazily index workspace & registered workspace/global docs so `.md` sections are up to date
     let _ = index_workspace(conn, paths, None)?;
 
     let scope_mode = match scope.map(|s| s.trim().to_lowercase()).as_deref() {
@@ -681,99 +588,88 @@ pub fn search_docs(
         true
     };
 
-    let fts_raw = search_doc_sections_fts(conn, query, 50).unwrap_or_default();
+    // 1. Fetch FTS5 BM25 ranked IDs and look up only those rows by primary key (O(k) index lookup)
+    let fts_ids = search_doc_sections_fts(conn, query, 100).unwrap_or_default();
+    let mut matched_sections: Vec<DocSectionRecord> = Vec::new();
+    let mut seen_ids: HashSet<i64> = HashSet::new();
 
-    let mut stmt = conn.prepare(
-        "SELECT id, file_path, heading, start_line, end_line, content
-         FROM doc_sections_meta",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(DocSectionRecord {
-            id: r.get(0)?,
-            file_path: r.get(1)?,
-            heading: r.get(2)?,
-            start_line: r.get(3)?,
-            end_line: r.get(4)?,
-            content: r.get(5)?,
-        })
-    })?;
-
-    let mut sections_map: HashMap<i64, DocSectionRecord> = HashMap::new();
-    let mut fts_filtered: Vec<i64> = Vec::new();
-    let fts_set: HashSet<i64> = fts_raw.iter().copied().collect();
-    let q_lower = query.to_lowercase();
-
-    for sec in rows.flatten() {
-        if !matches_file(&sec.file_path) {
-            continue;
-        }
-        if !fts_set.contains(&sec.id)
-            && (sec.heading.to_lowercase().contains(&q_lower)
-                || sec.content.to_lowercase().contains(&q_lower))
-        {
-            fts_filtered.push(sec.id);
-        }
-        sections_map.insert(sec.id, sec);
-    }
-
-    let mut ordered_fts = Vec::new();
-    for id in fts_raw {
-        if sections_map.contains_key(&id) {
-            ordered_fts.push(id);
-        }
-    }
-    for id in fts_filtered {
-        if !ordered_fts.contains(&id) {
-            ordered_fts.push(id);
+    if !fts_ids.is_empty() {
+        let mut by_id = conn.prepare_cached(
+            "SELECT id, file_path, heading, start_line, end_line, content
+             FROM doc_sections_meta WHERE id = ?1",
+        )?;
+        for id in fts_ids {
+            if let Ok(sec) = by_id.query_row(params![id], |r| {
+                Ok(DocSectionRecord {
+                    id: r.get(0)?,
+                    file_path: r.get(1)?,
+                    heading: r.get(2)?,
+                    start_line: r.get(3)?,
+                    end_line: r.get(4)?,
+                    content: r.get(5)?,
+                })
+            }) && matches_file(&sec.file_path)
+                && seen_ids.insert(sec.id)
+            {
+                matched_sections.push(sec);
+            }
         }
     }
 
-    if ordered_fts.is_empty() {
+    // 2. Bounded SQL LIKE fallback only if FTS5 yielded fewer than 8 filtered results
+    if matched_sections.len() < 8 {
+        let like_pat = format!("%{}%", query.trim().to_lowercase());
+        let mut like_stmt = conn.prepare(
+            "SELECT id, file_path, heading, start_line, end_line, content
+             FROM doc_sections_meta
+             WHERE LOWER(heading) LIKE ?1 OR LOWER(file_path) LIKE ?1 OR LOWER(content) LIKE ?1
+             LIMIT 80",
+        )?;
+        let rows = like_stmt.query_map(params![like_pat], |r| {
+            Ok(DocSectionRecord {
+                id: r.get(0)?,
+                file_path: r.get(1)?,
+                heading: r.get(2)?,
+                start_line: r.get(3)?,
+                end_line: r.get(4)?,
+                content: r.get(5)?,
+            })
+        })?;
+        for sec in rows.flatten() {
+            if matches_file(&sec.file_path) && seen_ids.insert(sec.id) {
+                matched_sections.push(sec);
+            }
+        }
+    }
+
+    if matched_sections.is_empty() {
         let msg = format!("No documentation sections matched query '{query}'.\n");
         return Ok((msg.clone(), msg.len()));
     }
 
-    let mut matched_files: HashSet<String> = HashSet::new();
     let mut blocks = Vec::new();
     let mut seen_ranges: Vec<(String, i64, i64)> = Vec::new();
 
-    for sec_id in ordered_fts {
-        if let Some(sec) = sections_map.get(&sec_id) {
-            // Skip overlapping windows from the same file if already covered
-            if seen_ranges.iter().any(|(fp, st, en)| {
-                fp == &sec.file_path && sec.start_line <= *en && sec.end_line >= *st
-            }) {
-                continue;
-            }
-            seen_ranges.push((sec.file_path.clone(), sec.start_line, sec.end_line));
-            matched_files.insert(sec.file_path.clone());
-            let block = format!(
-                "### {} [{start}..{end}] — `{heading}`\n{content}\n\n",
-                sec.file_path,
-                start = sec.start_line,
-                end = sec.end_line,
-                heading = sec.heading,
-                content = sec.content
-            );
-            blocks.push(block);
+    for sec in matched_sections {
+        if seen_ranges.iter().any(|(fp, st, en)| {
+            fp == &sec.file_path && sec.start_line <= *en && sec.end_line >= *st
+        }) {
+            continue;
         }
-    }
-
-    let mut raw_bytes = 0usize;
-    for fp in &matched_files {
-        let file_total: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM doc_sections_meta WHERE file_path = ?1",
-                params![fp],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        raw_bytes += file_total as usize;
+        seen_ranges.push((sec.file_path.clone(), sec.start_line, sec.end_line));
+        blocks.push(format!(
+            "### {} [{start}..{end}] — `{heading}`\n{content}\n\n",
+            sec.file_path,
+            start = sec.start_line,
+            end = sec.end_line,
+            heading = sec.heading,
+            content = sec.content
+        ));
     }
 
     let body = apply_token_budget(&blocks, budget_tokens);
     let out = format!("# Documentation Search Results (`{query}`)\n\n{body}");
-    Ok((out.clone(), raw_bytes.max(out.len())))
+    Ok((out.clone(), out.len()))
 }
 
 pub fn slugify(input: &str) -> String {
@@ -803,7 +699,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_remember_wikilinks_handoff_backlog_and_recall() {
+    fn test_remember_wikilinks_and_recall() {
         let temp = std::env::temp_dir().join(format!("lee_mem_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp).unwrap();
@@ -836,40 +732,11 @@ mod tests {
         )
         .unwrap();
 
-        store_memory(
-            &conn,
-            &paths,
-            "Add CJK Substring Test",
-            "Verify smart_grep works on non-space scripts.",
-            Some("backlog, test"),
-            Some("backlog"),
-        )
-        .unwrap();
-
-        store_memory(
-            &conn,
-            &paths,
-            "Phase 6 Handoff",
-            "Completed all 9 MCP tools; next step is running production benchmarks.",
-            Some("session, handoff"),
-            Some("handoff"),
-        )
-        .unwrap();
-
         // Verify 1-hop [[wikilink]] expansion: querying Indexer Transaction Rule pulls in Database WAL Mode
         let (recalled, _) =
             recall_memories(&conn, &paths, "Indexer Transaction Rule", 600).unwrap();
         assert!(recalled.contains("Indexer Transaction Rule"));
         assert!(recalled.contains("Database WAL Mode"));
-
-        // Verify generated INDEX.md exists and contains wikilinks
-        let index_md = fs::read_to_string(paths.notes_dir.join("INDEX.md")).unwrap();
-        assert!(index_md.contains("[[database-wal-mode|Database WAL Mode]]"));
-
-        // Verify backlog & handoff report
-        let report = list_backlog_and_handoff(&conn).unwrap();
-        assert!(report.contains("Phase 6 Handoff"));
-        assert!(report.contains("Add CJK Substring Test"));
 
         let _ = fs::remove_dir_all(&temp);
     }

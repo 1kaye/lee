@@ -8,19 +8,14 @@ pub mod memory;
 pub mod security;
 
 use crate::config::{default_doc_name, AppPaths, DocEntry, DocScope};
-use crate::db::{
-    init_connection, query_daily_token_metrics, query_recent_token_history, query_token_metrics,
-    record_token_metric,
-};
-use crate::digest::{digest_raw_output, run_command_digest_with_exit};
+use crate::db::init_connection;
+use crate::digest::run_command_digest_with_exit;
 use crate::hooks::{
-    auto_sync_agents_md, discover_missed_savings, install_antigravity_hook_plugin,
-    process_antigravity_hook, process_claude_hook,
+    auto_sync_agents_md, install_antigravity_hook_plugin, process_antigravity_hook,
+    process_claude_hook,
 };
 use crate::indexer::{index_workspace, purge_source_from_db, update_registered_docs};
-use crate::mcp::protocol::mcp_schema_overhead_bytes;
 use crate::mcp::run_stdio_server;
-use crate::memory::{list_backlog_and_handoff, recall_memories};
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
@@ -71,7 +66,7 @@ enum Commands {
         #[arg(short = 'g', long = "global", visible_alias = "g", conflicts_with = "workspace")]
         global: bool,
     },
-    /// List or incrementally update registered workspace and global docs
+    /// List registered workspace & global docs (`--json`) or run `lee docs update`
     Docs {
         #[command(subcommand)]
         action: Option<DocsAction>,
@@ -98,35 +93,17 @@ enum Commands {
     Index,
     /// Show current workspace index status and registered docs
     Status,
-    /// Display token-saving audit table and net token report (supports `--daily` and `--history`)
-    Stats {
-        /// Show daily token savings breakdown with ASCII bar chart
-        #[arg(long)]
-        daily: bool,
-        /// Show recent individual tool calls and saved tokens
-        #[arg(long)]
-        history: bool,
-    },
-    /// Scan AI session transcripts (.jsonl) to find bypassed raw commands/file reads and missed token savings
-    Discover {
-        /// Optional path to a transcript .jsonl file or directory (defaults to Antigravity & Claude Code logs)
-        path: Option<PathBuf>,
-    },
-    /// List latest Session Handoffs and aging Backlog work items from .lee/.notes/
-    Backlog,
     /// Revert configuration & index files created by `init` without deleting .lee/.notes/
     Undo {
         /// Skip `[y/N]` confirmation prompt
         #[arg(short, long)]
         yes: bool,
     },
-    /// Lifecycle hook interceptor (`antigravity`, `claude`, `prompt`, or `digest`)
+    /// PreToolUse hook interceptor (`antigravity` or `claude`)
     Hook {
-        /// Hook event mode: `antigravity`, `claude`, `prompt`, or `digest`
+        /// Hook event mode: `antigravity` or `claude`
         #[arg(value_enum)]
         event: HookEvent,
-        /// Optional query string for `hook prompt`
-        query: Option<String>,
     },
 }
 
@@ -138,8 +115,6 @@ enum DocsAction {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum HookEvent {
-    Prompt,
-    Digest,
     Antigravity,
     Claude,
 }
@@ -163,7 +138,7 @@ fn main() -> Result<()> {
             workspace,
             global,
         } => {
-            let _ = workspace; // default scope when neither --w nor --g is set
+            let _ = workspace;
             let scope = if global {
                 DocScope::Global
             } else {
@@ -192,11 +167,8 @@ fn main() -> Result<()> {
         }
         Commands::Index => cmd_index(&paths),
         Commands::Status => cmd_status(&paths),
-        Commands::Stats { daily, history } => cmd_stats(&paths, daily, history),
-        Commands::Discover { path } => cmd_discover(path.as_deref()),
-        Commands::Backlog => cmd_backlog(&paths),
         Commands::Undo { yes } => cmd_undo(&paths, yes),
-        Commands::Hook { event, query } => cmd_hook(&paths, event, query.as_deref()),
+        Commands::Hook { event } => cmd_hook(event),
     }
 }
 
@@ -207,9 +179,6 @@ fn cmd_init(paths: &AppPaths, global: bool) -> Result<()> {
 
     let cfg = paths.load_config().unwrap_or_default();
 
-    // Remove redundant local `AGENTS.md`; active agent rules are installed in
-    // `.agents/plugins/lee/rules/AGENTS.md` (and `~/.gemini/config/plugins/lee/rules/AGENTS.md` for `--global`)
-    // so we never duplicate rules or pollute a project's root `./AGENTS.md`.
     let legacy_local_agents = paths.local_dir.join("AGENTS.md");
     if legacy_local_agents.exists() {
         let _ = fs::remove_file(&legacy_local_agents);
@@ -265,22 +234,15 @@ fn cmd_exec(paths: &AppPaths, command_parts: &[String]) -> Result<()> {
     paths.ensure_local_dirs()?;
     let conn = init_connection(&paths.local_db)?;
     let full_cmd = command_parts.join(" ");
-    let (out, raw_bytes, exit_code) =
+    let (out, _raw_bytes, exit_code) =
         run_command_digest_with_exit(&conn, paths, &full_cmd, None)?;
-    let _ = record_token_metric(&conn, "exec", raw_bytes, out.len());
     print!("{out}");
     if !out.ends_with('\n') {
         println!();
     }
-    if exit_code != 0 && exit_code > 0 {
+    if exit_code > 0 {
         std::process::exit(exit_code);
     }
-    Ok(())
-}
-
-fn cmd_discover(custom_path: Option<&std::path::Path>) -> Result<()> {
-    let report = discover_missed_savings(custom_path)?;
-    print!("{report}");
     Ok(())
 }
 
@@ -439,18 +401,18 @@ fn cmd_docs_update(paths: &AppPaths) -> Result<()> {
 }
 
 fn purge_removed_docs_if_unused(paths: &AppPaths, removed: &[DocEntry]) -> Result<usize> {
-    if !paths.local_db.exists() {
+    if !paths.local_db.exists() || removed.is_empty() {
         return Ok(0);
     }
     let remaining = paths.all_doc_paths();
     let conn = init_connection(&paths.local_db)?;
-    let mut total = 0usize;
+    let mut purged_files = 0usize;
     for entry in removed {
         if !remaining.contains(&entry.path) {
-            total += purge_source_from_db(&conn, &entry.path)?;
+            purged_files += purge_source_from_db(&conn, &entry.path)?;
         }
     }
-    Ok(total)
+    Ok(purged_files)
 }
 
 fn cmd_remove_docs(
@@ -460,112 +422,135 @@ fn cmd_remove_docs(
     all: bool,
 ) -> Result<()> {
     if all {
-        let scope = scope_filter.unwrap_or(DocScope::Workspace);
-        let removed_list = paths.clear_docs(scope)?;
-        let total_purged = purge_removed_docs_if_unused(paths, &removed_list)?;
+        let target_scope = scope_filter.unwrap_or(DocScope::Workspace);
+        let removed = paths.clear_docs(target_scope)?;
+        if removed.is_empty() {
+            println!("[lee] No {} docs registered.", target_scope.as_str());
+            return Ok(());
+        }
+        let purged_files = purge_removed_docs_if_unused(paths, &removed)?;
         println!(
             "[lee] Removed all {} {} doc(s) and purged {} indexed file(s) from SQLite.",
-            removed_list.len(),
-            scope.as_str(),
-            total_purged
+            removed.len(),
+            target_scope.as_str(),
+            purged_files
         );
         return Ok(());
     }
 
-    let mut entries: Vec<(DocScope, DocEntry)> = Vec::new();
-    if scope_filter.is_none() || scope_filter == Some(DocScope::Workspace) {
-        for d in paths.load_config().unwrap_or_default().docs {
-            entries.push((DocScope::Workspace, d));
-        }
-    }
-    if scope_filter.is_none() || scope_filter == Some(DocScope::Global) {
-        for d in paths.load_global_config().unwrap_or_default().docs {
-            entries.push((DocScope::Global, d));
-        }
-    }
-
-    let chosen: (Option<DocScope>, String) = match target {
-        Some(arg) => {
-            if let Ok(idx) = arg.trim().parse::<usize>() {
-                if idx >= 1 && idx <= entries.len() {
-                    let (sc, ref entry) = entries[idx - 1];
-                    (Some(sc), entry.path.to_string_lossy().to_string())
-                } else {
-                    anyhow::bail!(
-                        "Invalid doc number {idx} (registered docs: 1..={}).",
-                        entries.len()
-                    );
-                }
-            } else {
-                (scope_filter, arg.to_string())
-            }
-        }
-        None => {
-            if entries.is_empty() {
-                println!("[lee] No docs registered.");
-                return Ok(());
-            }
-            println!("Registered Docs:");
-            for (i, (sc, doc)) in entries.iter().enumerate() {
-                println!(
-                    "  [{}] [{}] {} -> {}",
-                    i + 1,
-                    sc.as_str(),
-                    doc.name,
-                    doc.path.display()
+    if let Some(raw_target) = target.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(scope) = scope_filter {
+            let Some(removed) = paths.remove_doc(scope, raw_target)? else {
+                anyhow::bail!(
+                    "No {} doc matched '{}'. Run `lee docs` to see registered docs.",
+                    scope.as_str(),
+                    raw_target
                 );
-            }
-            let clear_scope = scope_filter.unwrap_or(DocScope::Workspace);
-            println!("  [a] Remove all {} docs", clear_scope.as_str());
-            println!("  [q] Cancel");
-            print!("\nSelect doc to remove [1-{}/a/q]: ", entries.len());
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let choice = input.trim();
-
-            if choice.is_empty() || choice.eq_ignore_ascii_case("q") {
-                println!("[lee] Cancelled.");
-                return Ok(());
-            }
-            if choice.eq_ignore_ascii_case("a") || choice.eq_ignore_ascii_case("all") {
-                let removed_list = paths.clear_docs(clear_scope)?;
-                let total_purged = purge_removed_docs_if_unused(paths, &removed_list)?;
-                println!(
-                    "[lee] Removed all {} {} doc(s) and purged {} indexed file(s) from SQLite.",
-                    removed_list.len(),
-                    clear_scope.as_str(),
-                    total_purged
-                );
-                return Ok(());
-            }
-            if let Ok(idx) = choice.parse::<usize>() {
-                if idx >= 1 && idx <= entries.len() {
-                    let (sc, ref entry) = entries[idx - 1];
-                    (Some(sc), entry.path.to_string_lossy().to_string())
-                } else {
-                    anyhow::bail!(
-                        "Invalid selection '{choice}'. Expected 1..={}.",
-                        entries.len()
-                    );
-                }
-            } else {
-                (scope_filter, choice.to_string())
-            }
-        }
-    };
-
-    let scopes_to_try: Vec<DocScope> = match chosen.0 {
-        Some(sc) => vec![sc],
-        None => vec![DocScope::Workspace, DocScope::Global],
-    };
-
-    for sc in scopes_to_try {
-        if let Some(removed) = paths.remove_doc(sc, &chosen.1)? {
+            };
             let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
             println!(
-                "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s) from SQLite.",
+                "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s).",
+                scope.as_str(),
+                removed.name,
+                removed.path.display(),
+                purged
+            );
+            return Ok(());
+        }
+
+        if let Some(removed) = paths.remove_doc(DocScope::Workspace, raw_target)? {
+            let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
+            println!(
+                "[lee] Removed workspace doc '{}' ({}) and purged {} indexed file(s).",
+                removed.name,
+                removed.path.display(),
+                purged
+            );
+            return Ok(());
+        }
+        if let Some(removed) = paths.remove_doc(DocScope::Global, raw_target)? {
+            let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
+            println!(
+                "[lee] Removed global doc '{}' ({}) and purged {} indexed file(s).",
+                removed.name,
+                removed.path.display(),
+                purged
+            );
+            return Ok(());
+        }
+        anyhow::bail!("No workspace or global doc matched '{raw_target}'. Run `lee docs` to see registered docs.");
+    }
+
+    let ws_docs = if scope_filter == Some(DocScope::Global) {
+        Vec::new()
+    } else {
+        paths.load_config().unwrap_or_default().docs
+    };
+    let global_docs = if scope_filter == Some(DocScope::Workspace) {
+        Vec::new()
+    } else {
+        paths.load_global_config().unwrap_or_default().docs
+    };
+
+    let mut combined: Vec<(DocScope, DocEntry)> = Vec::new();
+    for d in ws_docs {
+        combined.push((DocScope::Workspace, d));
+    }
+    for d in global_docs {
+        combined.push((DocScope::Global, d));
+    }
+
+    if combined.is_empty() {
+        println!("[lee] No registered docs to remove.");
+        return Ok(());
+    }
+
+    println!("Registered Docs:");
+    for (i, (sc, doc)) in combined.iter().enumerate() {
+        println!(
+            "  [{}] ({}) {} -> {}",
+            i + 1,
+            sc.as_str(),
+            doc.name,
+            doc.path.display()
+        );
+    }
+    print!("Enter number or name to remove (or 'all', empty to cancel): ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let choice = input.trim();
+    if choice.is_empty() {
+        println!("[lee] Cancelled.");
+        return Ok(());
+    }
+    if choice.eq_ignore_ascii_case("all") {
+        let mut all_removed = Vec::new();
+        if scope_filter != Some(DocScope::Global) {
+            all_removed.extend(paths.clear_docs(DocScope::Workspace)?);
+        }
+        if scope_filter != Some(DocScope::Workspace) {
+            all_removed.extend(paths.clear_docs(DocScope::Global)?);
+        }
+        let purged = purge_removed_docs_if_unused(paths, &all_removed)?;
+        println!(
+            "[lee] Removed {} doc(s) and purged {} indexed file(s).",
+            all_removed.len(),
+            purged
+        );
+        return Ok(());
+    }
+
+    if let Ok(idx) = choice.parse::<usize>()
+        && idx >= 1
+        && idx <= combined.len()
+    {
+        let (sc, ref entry) = combined[idx - 1];
+        if let Some(removed) = paths.remove_doc(sc, &entry.name)? {
+            let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
+            println!(
+                "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s).",
                 sc.as_str(),
                 removed.name,
                 removed.path.display(),
@@ -575,17 +560,7 @@ fn cmd_remove_docs(
         }
     }
 
-    let purged = if paths.local_db.exists() {
-        let conn = init_connection(&paths.local_db)?;
-        purge_source_from_db(&conn, std::path::Path::new(&chosen.1))?
-    } else {
-        0
-    };
-    println!(
-        "[lee] Doc '{}' was not found in config (purged {} matching DB entries).",
-        chosen.1, purged
-    );
-    Ok(())
+    cmd_remove_docs(paths, Some(choice), scope_filter, false)
 }
 
 fn cmd_index(paths: &AppPaths) -> Result<()> {
@@ -680,140 +655,6 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(paths: &AppPaths, daily: bool, history: bool) -> Result<()> {
-    if !paths.local_db.exists() {
-        println!(
-            "[lee] No database found at {}. Run `lee init` first.",
-            paths.local_db.display()
-        );
-        return Ok(());
-    }
-    let conn = init_connection(&paths.local_db)?;
-    let rows = query_token_metrics(&conn)?;
-
-    println!(
-        "{:<16} | {:>8} | {:>12} | {:>12} | {:>10} | {:>14}",
-        "Tool Name", "Calls", "Raw Bytes", "Sent Bytes", "Saved %", "Saved Tokens"
-    );
-    println!("{}", "-".repeat(86));
-
-    let mut grand_calls = 0i64;
-    let mut grand_raw = 0i64;
-    let mut grand_sent = 0i64;
-    let mut grand_saved = 0i64;
-
-    for r in &rows {
-        grand_calls += r.calls;
-        grand_raw += r.raw_bytes;
-        grand_sent += r.sent_bytes;
-        grand_saved += r.saved_bytes;
-
-        let pct = if r.raw_bytes > 0 {
-            (r.saved_bytes as f64 / r.raw_bytes as f64) * 100.0
-        } else {
-            0.0
-        };
-        let saved_tokens = r.saved_bytes / 4;
-        println!(
-            "{:<16} | {:>8} | {:>12} | {:>12} | {:>9.1}% | {:>14}",
-            r.tool_name, r.calls, r.raw_bytes, r.sent_bytes, pct, saved_tokens
-        );
-    }
-
-    println!("{}", "-".repeat(86));
-    let total_pct = if grand_raw > 0 {
-        (grand_saved as f64 / grand_raw as f64) * 100.0
-    } else {
-        0.0
-    };
-    let gross_saved_tokens = grand_saved / 4;
-    let schema_bytes = mcp_schema_overhead_bytes() as i64;
-    let schema_tokens = schema_bytes / 4;
-    let net_saved_tokens = gross_saved_tokens - schema_tokens;
-    let ratio = if grand_sent + schema_bytes > 0 {
-        grand_raw as f64 / (grand_sent + schema_bytes) as f64
-    } else {
-        1.0
-    };
-
-    println!(
-        "{:<16} | {:>8} | {:>12} | {:>12} | {:>9.1}% | {:>14}",
-        "GROSS TOTAL", grand_calls, grand_raw, grand_sent, total_pct, gross_saved_tokens
-    );
-    println!(
-        "\n--- Net Token Attribution ---\n\
-         MCP Tool Schema Overhead : {schema_bytes} bytes (~{schema_tokens} tokens for 10 tools)\n\
-         Gross Tokens Saved       : {gross_saved_tokens} tokens\n\
-         Net Tokens Saved         : {net_saved_tokens} tokens ({ratio:.1}x net compression ratio)"
-    );
-
-    if daily {
-        let daily_rows = query_daily_token_metrics(&conn)?;
-        let max_saved = daily_rows
-            .iter()
-            .map(|d| d.saved_bytes / 4)
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        println!(
-            "\n--- Daily Savings Breakdown (Last {} Day(s)) ---",
-            daily_rows.len()
-        );
-        println!(
-            "{:<12} | {:>6} | {:>12} | {:>9} | Graph",
-            "Date", "Calls", "Saved Tokens", "Saved %"
-        );
-        println!("{}", "-".repeat(78));
-        for d in &daily_rows {
-            let saved_tok = d.saved_bytes / 4;
-            let pct = if d.raw_bytes > 0 {
-                (d.saved_bytes as f64 / d.raw_bytes as f64) * 100.0
-            } else {
-                0.0
-            };
-            let bar_len = ((saved_tok as f64 / max_saved as f64) * 24.0).round() as usize;
-            let bar = "█".repeat(bar_len.max(usize::from(saved_tok > 0)));
-            println!(
-                "{:<12} | {:>6} | {:>12} | {:>8.1}% | {bar}",
-                d.day, d.calls, saved_tok, pct
-            );
-        }
-    }
-
-    if history {
-        let hist = query_recent_token_history(&conn, 25)?;
-        println!(
-            "\n--- Recent Tool Call History (Last {} Call(s)) ---",
-            hist.len()
-        );
-        println!(
-            "{:<19} | {:<15} | {:>10} | {:>10} | {:>12}",
-            "Timestamp", "Tool", "Raw Bytes", "Sent Bytes", "Saved Tokens"
-        );
-        println!("{}", "-".repeat(78));
-        for h in &hist {
-            println!(
-                "{:<19} | {:<15} | {:>10} | {:>10} | {:>12}",
-                h.timestamp,
-                h.tool_name,
-                h.raw_bytes,
-                h.sent_bytes,
-                h.saved_bytes / 4
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn cmd_backlog(paths: &AppPaths) -> Result<()> {
-    paths.ensure_local_dirs()?;
-    let conn = init_connection(&paths.local_db)?;
-    let report = list_backlog_and_handoff(&conn)?;
-    print!("{report}");
-    Ok(())
-}
-
 fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
     let local_hook_plugin = paths.project_root.join(".agents/plugins/lee");
     if !paths.local_dir.exists() && !local_hook_plugin.exists() {
@@ -850,7 +691,6 @@ fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
         }
     }
 
-    // Remove generated config/DB/rule files inside .lee/ while preserving .lee/.notes/
     for file in [
         paths.local_db.clone(),
         paths.local_dir.join("lee.db-wal"),
@@ -863,12 +703,10 @@ fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
         }
     }
 
-    // Also remove local .agents/plugins/lee/ hook plugin installed by `lee init`
     if local_hook_plugin.exists() {
         let _ = fs::remove_dir_all(&local_hook_plugin);
     }
 
-    // Only remove .lee/ itself if .notes/ has no user Markdown notes
     if !has_notes && paths.local_dir.exists() {
         fs::remove_dir_all(&paths.local_dir)?;
         println!(
@@ -887,60 +725,20 @@ fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_hook(paths: &AppPaths, event: HookEvent, query: Option<&str>) -> Result<()> {
+fn cmd_hook(event: HookEvent) -> Result<()> {
+    let mut raw = String::new();
+    let _ = io::stdin().read_to_string(&mut raw);
     match event {
         HookEvent::Antigravity => {
-            let mut raw = String::new();
-            let _ = io::stdin().read_to_string(&mut raw);
             let out = process_antigravity_hook(&raw);
             let _ = writeln!(io::stdout(), "{out}");
-            return Ok(());
         }
         HookEvent::Claude => {
-            let mut raw = String::new();
-            let _ = io::stdin().read_to_string(&mut raw);
             if let Some(out) = process_claude_hook(&raw) {
                 let _ = writeln!(io::stdout(), "{out}");
             }
-            return Ok(());
         }
-        HookEvent::Prompt | HookEvent::Digest => {}
     }
-
-    paths.ensure_local_dirs()?;
-    let conn = init_connection(&paths.local_db)?;
-
-    match event {
-        HookEvent::Prompt => {
-            let q = match query {
-                Some(s) if !s.trim().is_empty() => s.to_string(),
-                _ => {
-                    let mut buf = String::new();
-                    let _ = io::stdin().read_to_string(&mut buf);
-                    buf
-                }
-            };
-            let q_trimmed = q.trim();
-            if q_trimmed.is_empty() {
-                return Ok(());
-            }
-            let (out, raw_bytes) = recall_memories(&conn, paths, q_trimmed, 600)?;
-            let _ = record_token_metric(&conn, "hook_prompt", raw_bytes, out.len());
-            print!("{out}");
-        }
-        HookEvent::Digest => {
-            let mut raw = String::new();
-            io::stdin().read_to_string(&mut raw)?;
-            if raw.trim().is_empty() {
-                return Ok(());
-            }
-            let digest = digest_raw_output(&conn, "stdin_pipe", &raw, Some(0))?;
-            let _ = record_token_metric(&conn, "hook_digest", raw.len(), digest.len());
-            print!("{digest}");
-        }
-        HookEvent::Antigravity | HookEvent::Claude => unreachable!(),
-    }
-
     Ok(())
 }
 
@@ -980,7 +778,6 @@ mod tests {
             Commands::RemoveDocs { global: true, workspace: false, target: Some(ref t), .. } if t == "gpui kit"
         ));
 
-        // Legacy alias still parses
         let cli = Cli::try_parse_from(["lee", "add-source", "/tmp/gpui"]).unwrap();
         assert!(matches!(cli.command, Commands::AddDocs { .. }));
     }

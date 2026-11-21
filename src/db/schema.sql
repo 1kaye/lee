@@ -99,17 +99,7 @@ CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories_meta BEGIN
     VALUES ('delete', old.id, old.topic, old.tags, old.content);
 END;
 
--- 8. Token Savings Statistics (Audit & Metrics)
-CREATE TABLE IF NOT EXISTS token_metrics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,
-    tool_name TEXT NOT NULL,
-    raw_bytes INTEGER NOT NULL,  -- Unfiltered payload size (full file / codebase / raw terminal log)
-    sent_bytes INTEGER NOT NULL, -- Compact summary/slice size actually sent to the AI
-    saved_bytes INTEGER NOT NULL -- Saved byte difference (1 token ~= 4 bytes)
-);
-
--- 9. Cross-File Symbol Reference & Call Graph Index
+-- 8. Cross-File Symbol Reference & Call Graph Index
 CREATE TABLE IF NOT EXISTS symbol_refs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol_name TEXT NOT NULL,

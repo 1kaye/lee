@@ -52,13 +52,6 @@ impl JsonRpcResponse {
     }
 }
 
-/// Returns the byte size of the serialized MCP tool list schema loaded at session start.
-pub fn mcp_schema_overhead_bytes() -> usize {
-    serde_json::to_string(&mcp_tools_list())
-        .map(|s| s.len())
-        .unwrap_or(0)
-}
-
 pub fn mcp_tools_list() -> Value {
     json!({
         "tools": [

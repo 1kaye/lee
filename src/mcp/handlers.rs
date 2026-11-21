@@ -1,5 +1,4 @@
 use crate::config::AppPaths;
-use crate::db::record_token_metric;
 use crate::digest::{recall_handle, run_command_digest};
 use crate::indexer::{
     build_outline, build_project_map, find_symbol_references, read_symbol_range, smart_grep_search,
@@ -16,19 +15,15 @@ pub fn dispatch_tool_call(
     args: &Value,
 ) -> Value {
     match execute_tool(conn, paths, tool_name, args) {
-        Ok((text, raw_bytes)) => {
-            let sent_bytes = text.len();
-            let _ = record_token_metric(conn, tool_name, raw_bytes, sent_bytes);
-            json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": text
-                    }
-                ],
-                "isError": false
-            })
-        }
+        Ok((text, _raw_bytes)) => json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": text
+                }
+            ],
+            "isError": false
+        }),
         Err(err) => json!({
             "content": [
                 {

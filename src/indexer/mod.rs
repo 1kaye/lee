@@ -212,6 +212,8 @@ pub fn index_workspace(
         rows
     };
 
+    let mut to_check: Vec<(PathBuf, String, bool, &'static str)> = Vec::new();
+
     for file_path in &files {
         let index_key = to_index_path(&paths.project_root, file_path);
         seen_keys.insert(index_key.clone());
@@ -235,30 +237,82 @@ pub fn index_workspace(
             continue;
         }
 
-        let Ok(raw_content) = fs::read_to_string(file_path) else {
-            continue;
-        };
-        stats.files_scanned += 1;
-        stats.total_raw_bytes += raw_content.len();
+        to_check.push((file_path.clone(), index_key, is_doc_source, expected_suffix));
+    }
 
-        let raw_hash = blake3::hash(raw_content.as_bytes()).to_hex().to_string();
-        let new_hash = format!("{raw_hash}{expected_suffix}");
+    if !to_check.is_empty() {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(to_check.len())
+            .max(1);
+        let chunk_size = to_check.len().div_ceil(workers);
+        let existing_ref = &existing_db_map;
 
-        if existing_db_map
-            .get(&index_key)
-            .map(|(h, _, _)| h.as_str())
-            == Some(new_hash.as_str())
-        {
-            stats.files_cached += 1;
-            continue;
-        }
+        let batch_results: Vec<
+            Vec<(usize, bool, Option<(String, String, parser::ParsedFileResult)>)>,
+        > = std::thread::scope(|s| {
+            let handles: Vec<_> = to_check
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for (file_path, index_key, is_doc_source, expected_suffix) in chunk {
+                            let Ok(raw_content) = fs::read_to_string(file_path) else {
+                                continue;
+                            };
+                            let raw_len = raw_content.len();
+                            let raw_hash =
+                                blake3::hash(raw_content.as_bytes()).to_hex().to_string();
+                            let new_hash = format!("{raw_hash}{expected_suffix}");
 
-        if let Some(mut parsed) = parse_file_content(file_path, &raw_content)? {
-            if is_doc_source {
-                attach_full_code_doc_section(file_path, &raw_content, &mut parsed);
+                            if existing_ref.get(index_key).map(|(h, _, _)| h.as_str())
+                                == Some(new_hash.as_str())
+                            {
+                                out.push((raw_len, true, None));
+                                continue;
+                            }
+
+                            if let Ok(Some(mut parsed)) =
+                                parse_file_content(file_path, &raw_content)
+                            {
+                                if *is_doc_source {
+                                    attach_full_code_doc_section(
+                                        file_path,
+                                        &raw_content,
+                                        &mut parsed,
+                                    );
+                                }
+                                out.push((
+                                    raw_len,
+                                    false,
+                                    Some((index_key.clone(), new_hash, parsed)),
+                                ));
+                            } else {
+                                out.push((raw_len, false, None));
+                            }
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .collect()
+        });
+
+        for batch in batch_results {
+            for (raw_len, is_cached, parsed_opt) in batch {
+                stats.files_scanned += 1;
+                stats.total_raw_bytes += raw_len;
+                if is_cached {
+                    stats.files_cached += 1;
+                } else if let Some((index_key, new_hash, parsed)) = parsed_opt {
+                    stats.files_reindexed += 1;
+                    upsert_parsed_file(&tx, &index_key, &new_hash, &parsed)?;
+                }
             }
-            stats.files_reindexed += 1;
-            upsert_parsed_file(&tx, &index_key, &new_hash, &parsed)?;
         }
     }
 
@@ -627,6 +681,204 @@ fn map_file_priority(path: &str) -> u8 {
     }
 }
 
+/// Computes PageRank centrality scores over workspace files from the AST `symbol_refs` graph
+/// (`import` = 3.0, `type_use` = 2.0, `call` = 1.0) so `project_map` surfaces core files first.
+fn compute_file_pagerank(conn: &Connection) -> HashMap<String, f64> {
+    let mut sym_to_files: HashMap<String, Vec<String>> = HashMap::new();
+    let mut all_files: HashSet<String> = HashSet::new();
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT name, file_path FROM symbols
+         WHERE kind != 'md_heading' AND file_path NOT LIKE '/%'",
+    ) && let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    {
+        for (name, fp) in rows.flatten() {
+            all_files.insert(fp.clone());
+            let list = sym_to_files.entry(name).or_default();
+            if !list.contains(&fp) {
+                list.push(fp);
+            }
+        }
+    }
+
+    if all_files.len() <= 1 {
+        return HashMap::new();
+    }
+
+    let mut edges: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut out_weight: HashMap<String, f64> = HashMap::new();
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT file_path, symbol_name, ref_kind, COUNT(*)
+         FROM symbol_refs
+         WHERE file_path NOT LIKE '/%'
+         GROUP BY file_path, symbol_name, ref_kind",
+    ) && let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    }) {
+        for (src_fp, sym, kind, cnt) in rows.flatten() {
+            let Some(targets) = sym_to_files.get(&sym) else {
+                continue;
+            };
+            let w_kind = match kind.as_str() {
+                "import" => 3.0,
+                "type_use" => 2.0,
+                _ => 1.0,
+            };
+            let w = (cnt as f64) * w_kind / (targets.len() as f64);
+            for dst_fp in targets {
+                if dst_fp != &src_fp {
+                    all_files.insert(src_fp.clone());
+                    *edges
+                        .entry(src_fp.clone())
+                        .or_default()
+                        .entry(dst_fp.clone())
+                        .or_insert(0.0) += w;
+                    *out_weight.entry(src_fp.clone()).or_insert(0.0) += w;
+                }
+            }
+        }
+    }
+
+    let n = all_files.len() as f64;
+    let init_score = 1.0 / n;
+    let damping = 0.85;
+    let base = (1.0 - damping) / n;
+    let mut ranks: HashMap<String, f64> = all_files.iter().map(|f| (f.clone(), init_score)).collect();
+
+    for _ in 0..10 {
+        let mut next: HashMap<String, f64> = all_files.iter().map(|f| (f.clone(), base)).collect();
+        let mut dangling_sum = 0.0;
+
+        for f in &all_files {
+            let r = ranks.get(f).copied().unwrap_or(0.0);
+            if let Some(targets) = edges.get(f)
+                && let Some(&total_w) = out_weight.get(f)
+                && total_w > 0.0
+            {
+                for (dst, w) in targets {
+                    *next.entry(dst.clone()).or_insert(base) += damping * r * (w / total_w);
+                }
+            } else {
+                dangling_sum += r;
+            }
+        }
+        if dangling_sum > 0.0 {
+            let add = damping * dangling_sum / n;
+            for val in next.values_mut() {
+                *val += add;
+            }
+        }
+        ranks = next;
+    }
+
+    ranks
+}
+
+/// Computes fuzzy similarity between `query` and `candidate` symbol names in `[0.0, 1.0]`,
+/// combining case-insensitive prefix/substring, ordered subsequence, and character bigram Dice score.
+fn fuzzy_symbol_score(query: &str, candidate: &str) -> f64 {
+    let q = query.trim().to_lowercase();
+    let c = candidate.trim().to_lowercase();
+    if q.is_empty() || c.is_empty() {
+        return 0.0;
+    }
+    if q == c {
+        return 1.0;
+    }
+    if c.starts_with(&q) {
+        return 0.92 - ((c.len() - q.len()) as f64 * 0.005).min(0.15);
+    }
+    if c.contains(&q) {
+        return 0.82 - ((c.len() - q.len()) as f64 * 0.005).min(0.15);
+    }
+
+    // Ordered subsequence check (e.g. "parse_md" in "parse_markdown")
+    let mut q_chars = q.chars().peekable();
+    for ch in c.chars() {
+        if q_chars.peek() == Some(&ch) {
+            q_chars.next();
+        }
+    }
+    let is_subseq = q_chars.peek().is_none();
+
+    // Character bigram Dice similarity
+    let q_bytes = q.as_bytes();
+    let c_bytes = c.as_bytes();
+    let dice = if q_bytes.len() >= 2 && c_bytes.len() >= 2 {
+        let mut q_bigrams: Vec<[u8; 2]> = q_bytes.windows(2).map(|w| [w[0], w[1]]).collect();
+        let mut matches = 0usize;
+        for w in c_bytes.windows(2) {
+            let bg = [w[0], w[1]];
+            if let Some(pos) = q_bigrams.iter().position(|x| *x == bg) {
+                matches += 1;
+                q_bigrams.swap_remove(pos);
+            }
+        }
+        (2.0 * matches as f64) / ((q_bytes.len() - 1 + c_bytes.len() - 1) as f64)
+    } else {
+        0.0
+    };
+
+    if is_subseq {
+        let ratio = (q.len() as f64) / (c.len() as f64);
+        (0.65 + 0.25 * ratio).max(dice)
+    } else {
+        dice
+    }
+}
+
+/// Finds top fuzzy-matched symbols from `symbols` when exact / SQL `LIKE` lookup returns no match.
+fn fuzzy_find_symbols(
+    conn: &Connection,
+    file_filter: Option<&str>,
+    clean_query: &str,
+    limit: usize,
+) -> Vec<(String, String, String, String, i64, i64, f64)> {
+    let mut candidates: Vec<(String, String, String, String, i64, i64, f64)> = Vec::new();
+    let sql = if file_filter.is_some() {
+        "SELECT file_path, kind, name, signature, start_line, end_line FROM symbols WHERE file_path = ?1"
+    } else {
+        "SELECT file_path, kind, name, signature, start_line, end_line FROM symbols WHERE (?1 IS NULL OR file_path = ?1)"
+    };
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return candidates;
+    };
+    let Ok(rows) = stmt.query_map(params![file_filter], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    }) else {
+        return candidates;
+    };
+
+    for (fp, kind, name, sig, st, en) in rows.flatten() {
+        let sc = fuzzy_symbol_score(clean_query, &name);
+        if sc >= 0.52 {
+            candidates.push((fp, kind, name, sig, st, en, sc));
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.6.partial_cmp(&a.6)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.starts_with('/').cmp(&b.0.starts_with('/')))
+            .then_with(|| a.2.len().cmp(&b.2.len()))
+    });
+    candidates.truncate(limit);
+    candidates
+}
+
 /// Tool 1: `project_map` — builds a compact directory & symbol/heading map within `max_tokens`.
 /// Prioritizes root + core code folders (`src/`, `crates/`, `lib/`, `app/`), collapses overflow folders
 /// into 1-line directory summaries, and summarizes external `sources`.
@@ -723,11 +975,21 @@ pub fn build_project_map(
             .unwrap_or(0) as usize;
     }
 
+    let file_ranks = compute_file_pagerank(conn);
     let mut ordered: Vec<(String, i64, String, Vec<String>)> = local_map
         .into_iter()
         .map(|(f, (l, ft, s))| (f, l, ft, s))
         .collect();
-    ordered.sort_by(|a, b| map_file_priority(&a.0).cmp(&map_file_priority(&b.0)).then(a.0.cmp(&b.0)));
+    ordered.sort_by(|a, b| {
+        map_file_priority(&a.0)
+            .cmp(&map_file_priority(&b.0))
+            .then_with(|| {
+                let ra = file_ranks.get(&a.0).copied().unwrap_or(0.0);
+                let rb = file_ranks.get(&b.0).copied().unwrap_or(0.0);
+                rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -971,7 +1233,13 @@ pub fn read_symbol_range(
         };
 
         let _ = index_workspace(conn, paths, None);
-        let matches = find_matches(conn)?;
+        let mut matches = find_matches(conn)?;
+        if matches.is_empty() {
+            for (fp, kind, name, _sig, st, en, _sc) in fuzzy_find_symbols(conn, None, clean_query, 4)
+            {
+                matches.push((fp, kind, name, st, en));
+            }
+        }
 
         let Some(first) = matches.first() else {
             bail!(
@@ -1029,6 +1297,13 @@ pub fn read_symbol_range(
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
+
+        let row = row.or_else(|| {
+            fuzzy_find_symbols(conn, Some(&index_key), clean_query, 1)
+                .into_iter()
+                .next()
+                .map(|(_fp, _k, name, sig, st, en, _sc)| (name, sig, st, en))
+        });
 
         let Some((name, sig, st, en)) = row else {
             bail!(
@@ -1560,17 +1835,12 @@ pub fn find_symbol_references(
         .collect();
 
     if rows.is_empty() {
-        let mut sugg_stmt = conn.prepare(
-            "SELECT DISTINCT name FROM (
-                SELECT name FROM symbols WHERE kind != 'md_heading' AND LOWER(name) LIKE LOWER(?1)
-                UNION
-                SELECT symbol_name AS name FROM symbol_refs WHERE LOWER(symbol_name) LIKE LOWER(?1)
-             ) ORDER BY LENGTH(name) ASC LIMIT 5",
-        )?;
-        let suggestions: Vec<String> = sugg_stmt
-            .query_map(params![format!("%{clean}%")], |r| r.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
+        let mut suggestions: Vec<String> = fuzzy_find_symbols(conn, None, clean, 5)
+            .into_iter()
+            .filter(|(_, k, _, _, _, _, _)| k != "md_heading")
+            .map(|(_, _, name, _, _, _, _)| name)
             .collect();
+        suggestions.dedup();
         let hint = if suggestions.is_empty() {
             String::new()
         } else {
@@ -1614,9 +1884,17 @@ pub fn find_symbol_references(
         )
     };
 
+    let mut hop1_callers: Vec<String> = Vec::new();
     for (fp, line, caller, kind, line_cnt) in &rows {
         if seen_files.insert(fp.clone()) {
             raw_bytes += (*line_cnt as usize).saturating_mul(45);
+        }
+        if let Some(c) = caller
+            && c != clean
+            && !hop1_callers.contains(c)
+            && hop1_callers.len() < 12
+        {
+            hop1_callers.push(c.clone());
         }
         match (kind.as_str(), caller.as_deref()) {
             ("import", None) => {
@@ -1630,6 +1908,44 @@ pub fn find_symbol_references(
             }
             (_, None) => {
                 out.push_str(&format!("- {fp}:{line} ({kind})\n"));
+            }
+        }
+    }
+
+    // 2-hop call graph impact: find callers of the 1-hop enclosing caller functions
+    if !hop1_callers.is_empty()
+        && let Ok(mut hop2_stmt) = conn.prepare(
+            "SELECT file_path, line_number, caller_symbol
+             FROM symbol_refs
+             WHERE symbol_name = ?1 AND ref_kind = 'call'
+             ORDER BY CASE WHEN file_path LIKE '/%' THEN 1 ELSE 0 END ASC, file_path ASC, line_number ASC
+             LIMIT 5",
+        )
+    {
+        let mut hop2_lines = Vec::new();
+        for c1 in &hop1_callers {
+            if let Ok(h2_rows) = hop2_stmt.query_map(params![c1], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            }) {
+                for (fp2, ln2, caller2) in h2_rows.flatten() {
+                    let via = match caller2.as_deref() {
+                        Some(c2) => format!("- {fp2}:{ln2} [in fn {c2}] -> calls {c1}\n"),
+                        None => format!("- {fp2}:{ln2} -> calls {c1}\n"),
+                    };
+                    if !hop2_lines.contains(&via) && hop2_lines.len() < 15 {
+                        hop2_lines.push(via);
+                    }
+                }
+            }
+        }
+        if !hop2_lines.is_empty() {
+            out.push_str("2-hop caller impact:\n");
+            for l in hop2_lines {
+                out.push_str(&l);
             }
         }
     }
@@ -1771,6 +2087,72 @@ mod tests {
         )
         .unwrap();
         assert!(cpp_out.contains("int calc_sum"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_pagerank_project_map_fuzzy_read_symbol_and_2hop_references() {
+        let temp = std::env::temp_dir().join(format!("lee_alg_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let src_dir = temp.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        // z_core.rs is alphabetically last, but referenced by both a_leaf.rs and b_mid.rs -> PageRank must rank z_core.rs first!
+        fs::write(
+            src_dir.join("z_core.rs"),
+            "pub fn execute_core_engine() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            src_dir.join("b_mid.rs"),
+            "use crate::z_core::execute_core_engine;\npub fn run_middle_stage() -> i32 {\n    execute_core_engine()\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            src_dir.join("a_leaf.rs"),
+            "use crate::z_core::execute_core_engine;\nuse crate::b_mid::run_middle_stage;\npub fn top_entry_handler() -> i32 {\n    let _ = execute_core_engine();\n    run_middle_stage()\n}\n",
+        )
+        .unwrap();
+
+        let mut paths = AppPaths::from_root(temp.clone()).unwrap();
+        paths.global_dir = temp.join("global_cfg");
+        paths.global_db = paths.global_dir.join("global.db");
+        paths.global_config_file = paths.global_dir.join("config.json");
+        paths.vault_dir = paths.global_dir.join("vault");
+        paths.ensure_local_dirs().unwrap();
+        paths.ensure_global_dirs().unwrap();
+
+        let mut conn = init_connection(&paths.local_db).unwrap();
+
+        // 1. PageRank puts src/z_core.rs ahead of src/a_leaf.rs despite alphabetical order
+        let (map_out, _) = build_project_map(&mut conn, &paths, None, 800).unwrap();
+        let pos_z = map_out.find("src/z_core.rs").unwrap();
+        let pos_a = map_out.find("src/a_leaf.rs").unwrap();
+        assert!(pos_z < pos_a, "Expected PageRank to rank src/z_core.rs before src/a_leaf.rs:\n{map_out}");
+
+        // 2. Fuzzy subsequence symbol lookup resolves "exec_core_eng" -> "execute_core_engine"
+        let (sym_out, _) = read_symbol_range(
+            &mut conn,
+            &paths,
+            None,
+            Some("exec_core_eng"),
+            None,
+            None,
+            1,
+            false,
+            false,
+            100,
+        )
+        .unwrap();
+        assert!(sym_out.contains("pub fn execute_core_engine"));
+
+        // 3. 2-hop call graph impact: execute_core_engine -> called by run_middle_stage -> called by top_entry_handler
+        let (refs_out, _) =
+            find_symbol_references(&mut conn, &paths, "execute_core_engine").unwrap();
+        assert!(refs_out.contains("[in fn run_middle_stage] (call)"));
+        assert!(refs_out.contains("2-hop caller impact:"));
+        assert!(refs_out.contains("[in fn top_entry_handler] -> calls run_middle_stage"));
 
         let _ = fs::remove_dir_all(&temp);
     }
