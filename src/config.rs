@@ -279,6 +279,24 @@ impl AppPaths {
         }
     }
 
+    pub fn workspace_doc_paths(&self) -> Vec<PathBuf> {
+        self.load_config()
+            .unwrap_or_default()
+            .docs
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
+    }
+
+    pub fn global_doc_paths(&self) -> Vec<PathBuf> {
+        self.load_global_config()
+            .unwrap_or_default()
+            .docs
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
+    }
+
     /// Returns all registered doc paths (workspace + global, deduplicated).
     pub fn all_doc_paths(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();

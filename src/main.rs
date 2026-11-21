@@ -14,7 +14,9 @@ use crate::hooks::{
     auto_sync_agents_md, install_antigravity_hook_plugin, process_antigravity_hook,
     process_claude_hook,
 };
-use crate::indexer::{index_workspace, purge_source_from_db, update_registered_docs};
+use crate::indexer::{
+    index_global_docs, index_workspace, purge_source_from_db, update_registered_docs,
+};
 use crate::mcp::run_stdio_server;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -285,23 +287,32 @@ fn cmd_add_docs(
         entry.path.display()
     );
 
-    if scope == DocScope::Workspace || paths.local_db.exists() {
-        let mut conn = init_connection(&paths.local_db)?;
-        let stats = index_workspace(&mut conn, paths, None)?;
-        println!(
-            "[lee] Re-indexed workspace + docs: {} files, {} code symbols, {} symbol refs, {} md headings, {} doc sections ({} ms).",
-            stats.files_scanned,
-            stats.code_symbols,
-            stats.symbol_refs,
-            stats.md_headings,
-            stats.doc_sections,
-            stats.elapsed_ms
-        );
-    } else {
-        println!(
-            "[lee] Saved globally in {}. It will be indexed automatically in any workspace on next query or `lee index`.",
-            paths.global_config_file.display()
-        );
+    match scope {
+        DocScope::Workspace => {
+            let mut conn = init_connection(&paths.local_db)?;
+            let stats = index_workspace(&mut conn, paths, None)?;
+            println!(
+                "[lee] Re-indexed workspace + workspace docs: {} files, {} code symbols, {} symbol refs, {} md headings, {} doc sections ({} ms).",
+                stats.files_scanned,
+                stats.code_symbols,
+                stats.symbol_refs,
+                stats.md_headings,
+                stats.doc_sections,
+                stats.elapsed_ms
+            );
+        }
+        DocScope::Global => {
+            let stats = index_global_docs(paths)?;
+            println!(
+                "[lee] Indexed global docs in {}: {} files, {} code symbols, {} md headings, {} doc sections ({} ms).",
+                paths.global_db.display(),
+                stats.files_scanned,
+                stats.code_symbols,
+                stats.md_headings,
+                stats.doc_sections,
+                stats.elapsed_ms
+            );
+        }
     }
     Ok(())
 }
@@ -343,6 +354,7 @@ fn cmd_docs_update(paths: &AppPaths) -> Result<()> {
     let start = std::time::Instant::now();
     let ws_docs = paths.load_config().unwrap_or_default().docs;
     let global_docs = paths.load_global_config().unwrap_or_default().docs;
+    let has_ws_docs = !ws_docs.is_empty();
 
     let mut all_docs: Vec<(DocScope, DocEntry)> = Vec::with_capacity(ws_docs.len() + global_docs.len());
     for doc in ws_docs {
@@ -357,9 +369,13 @@ fn cmd_docs_update(paths: &AppPaths) -> Result<()> {
         return Ok(());
     }
 
-    paths.ensure_local_dirs()?;
-    let mut conn = init_connection(&paths.local_db)?;
-    let reports = update_registered_docs(&mut conn, paths, &all_docs)?;
+    let mut local_conn = if has_ws_docs {
+        paths.ensure_local_dirs()?;
+        Some(init_connection(&paths.local_db)?)
+    } else {
+        None
+    };
+    let reports = update_registered_docs(local_conn.as_mut(), paths, &all_docs)?;
 
     let mut updated_docs = 0usize;
     let mut skipped_docs = 0usize;
@@ -400,12 +416,22 @@ fn cmd_docs_update(paths: &AppPaths) -> Result<()> {
     Ok(())
 }
 
-fn purge_removed_docs_if_unused(paths: &AppPaths, removed: &[DocEntry]) -> Result<usize> {
-    if !paths.local_db.exists() || removed.is_empty() {
+fn purge_removed_docs_if_unused(
+    paths: &AppPaths,
+    scope: DocScope,
+    removed: &[DocEntry],
+) -> Result<usize> {
+    if removed.is_empty() {
         return Ok(0);
     }
-    let remaining = paths.all_doc_paths();
-    let conn = init_connection(&paths.local_db)?;
+    let (db_path, remaining) = match scope {
+        DocScope::Workspace => (&paths.local_db, paths.workspace_doc_paths()),
+        DocScope::Global => (&paths.global_db, paths.global_doc_paths()),
+    };
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = init_connection(db_path)?;
     let mut purged_files = 0usize;
     for entry in removed {
         if !remaining.contains(&entry.path) {
@@ -428,7 +454,7 @@ fn cmd_remove_docs(
             println!("[lee] No {} docs registered.", target_scope.as_str());
             return Ok(());
         }
-        let purged_files = purge_removed_docs_if_unused(paths, &removed)?;
+        let purged_files = purge_removed_docs_if_unused(paths, target_scope, &removed)?;
         println!(
             "[lee] Removed all {} {} doc(s) and purged {} indexed file(s) from SQLite.",
             removed.len(),
@@ -447,7 +473,7 @@ fn cmd_remove_docs(
                     raw_target
                 );
             };
-            let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
+            let purged = purge_removed_docs_if_unused(paths, scope, std::slice::from_ref(&removed))?;
             println!(
                 "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s).",
                 scope.as_str(),
@@ -459,7 +485,11 @@ fn cmd_remove_docs(
         }
 
         if let Some(removed) = paths.remove_doc(DocScope::Workspace, raw_target)? {
-            let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
+            let purged = purge_removed_docs_if_unused(
+                paths,
+                DocScope::Workspace,
+                std::slice::from_ref(&removed),
+            )?;
             println!(
                 "[lee] Removed workspace doc '{}' ({}) and purged {} indexed file(s).",
                 removed.name,
@@ -469,7 +499,11 @@ fn cmd_remove_docs(
             return Ok(());
         }
         if let Some(removed) = paths.remove_doc(DocScope::Global, raw_target)? {
-            let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
+            let purged = purge_removed_docs_if_unused(
+                paths,
+                DocScope::Global,
+                std::slice::from_ref(&removed),
+            )?;
             println!(
                 "[lee] Removed global doc '{}' ({}) and purged {} indexed file(s).",
                 removed.name,
@@ -526,19 +560,19 @@ fn cmd_remove_docs(
         return Ok(());
     }
     if choice.eq_ignore_ascii_case("all") {
-        let mut all_removed = Vec::new();
+        let mut total_removed = 0usize;
+        let mut purged = 0usize;
         if scope_filter != Some(DocScope::Global) {
-            all_removed.extend(paths.clear_docs(DocScope::Workspace)?);
+            let rem = paths.clear_docs(DocScope::Workspace)?;
+            total_removed += rem.len();
+            purged += purge_removed_docs_if_unused(paths, DocScope::Workspace, &rem)?;
         }
         if scope_filter != Some(DocScope::Workspace) {
-            all_removed.extend(paths.clear_docs(DocScope::Global)?);
+            let rem = paths.clear_docs(DocScope::Global)?;
+            total_removed += rem.len();
+            purged += purge_removed_docs_if_unused(paths, DocScope::Global, &rem)?;
         }
-        let purged = purge_removed_docs_if_unused(paths, &all_removed)?;
-        println!(
-            "[lee] Removed {} doc(s) and purged {} indexed file(s).",
-            all_removed.len(),
-            purged
-        );
+        println!("[lee] Removed {total_removed} doc(s) and purged {purged} indexed file(s).");
         return Ok(());
     }
 
@@ -548,7 +582,7 @@ fn cmd_remove_docs(
     {
         let (sc, ref entry) = combined[idx - 1];
         if let Some(removed) = paths.remove_doc(sc, &entry.name)? {
-            let purged = purge_removed_docs_if_unused(paths, std::slice::from_ref(&removed))?;
+            let purged = purge_removed_docs_if_unused(paths, sc, std::slice::from_ref(&removed))?;
             println!(
                 "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s).",
                 sc.as_str(),
@@ -568,7 +602,7 @@ fn cmd_index(paths: &AppPaths) -> Result<()> {
     let mut conn = init_connection(&paths.local_db)?;
     let stats = index_workspace(&mut conn, paths, None)?;
     println!(
-        "[lee] Indexed {} files ({} re-indexed, {} cached) | {} code symbols | {} symbol refs | {} md headings | {} doc sections in {} ms.",
+        "[lee] Indexed workspace: {} files ({} re-indexed, {} cached) | {} code symbols | {} symbol refs | {} md headings | {} doc sections in {} ms.",
         stats.files_scanned,
         stats.files_reindexed,
         stats.files_cached,
@@ -578,6 +612,19 @@ fn cmd_index(paths: &AppPaths) -> Result<()> {
         stats.doc_sections,
         stats.elapsed_ms
     );
+    if !paths.global_doc_paths().is_empty() {
+        let gstats = index_global_docs(paths)?;
+        println!(
+            "[lee] Indexed global docs ({}): {} files ({} re-indexed, {} cached) | {} md headings | {} doc sections in {} ms.",
+            paths.global_db.display(),
+            gstats.files_scanned,
+            gstats.files_reindexed,
+            gstats.files_cached,
+            gstats.md_headings,
+            gstats.doc_sections,
+            gstats.elapsed_ms
+        );
+    }
     Ok(())
 }
 
@@ -650,6 +697,30 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
         println!(
             "Index Counts : {files} files | {syms} code symbols | {sym_refs} symbol refs | {headings} md headings | {sections} doc windows | {memories} project memories | {handles} handles"
         );
+    }
+
+    if paths.global_db.exists() {
+        if let Ok(gconn) = init_connection(&paths.global_db) {
+            let gfiles: i64 = gconn
+                .query_row("SELECT COUNT(*) FROM file_hashes", [], |r| r.get(0))
+                .unwrap_or(0);
+            let gheadings: i64 = gconn
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE kind = 'md_heading'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let gsections: i64 = gconn
+                .query_row("SELECT COUNT(*) FROM doc_sections_meta", [], |r| r.get(0))
+                .unwrap_or(0);
+            if gfiles > 0 {
+                println!(
+                    "Global Index : {gfiles} files | {gheadings} md headings | {gsections} doc windows ({})",
+                    paths.global_db.display()
+                );
+            }
+        }
     }
 
     Ok(())

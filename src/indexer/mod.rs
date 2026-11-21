@@ -3,7 +3,7 @@ pub mod markdown;
 pub mod parser;
 
 use crate::config::{AppPaths, DocEntry, DocScope};
-use crate::db::now_unix;
+use crate::db::{init_connection, now_unix};
 use crate::indexer::languages::CodeLanguage;
 use crate::indexer::markdown::{DocSectionChunk, ExtractedSymbol};
 use crate::indexer::parser::{is_non_doc_comment_line, parse_file_content, ConfigFormat, IndexedFileType};
@@ -161,14 +161,81 @@ fn attach_full_code_doc_section(
     }
 }
 
-/// Scans and lazily indexes all supported code and Markdown files in `subpath` + `sources`.
+type ParallelParseRow = (String, usize, bool, Option<(String, parser::ParsedFileResult)>);
+
+/// Reads, hashes (`blake3`), and parses uncached files across CPU cores using `std::thread::scope`.
+fn parse_files_parallel(
+    to_check: &[(PathBuf, String, bool, &'static str)],
+    existing_hashes: &HashMap<String, String>,
+) -> Vec<ParallelParseRow> {
+    if to_check.is_empty() {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(to_check.len())
+        .max(1);
+    let chunk_size = to_check.len().div_ceil(workers);
+
+    let batches: Vec<Vec<ParallelParseRow>> = std::thread::scope(|s| {
+        let handles: Vec<_> = to_check
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(move || {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (file_path, index_key, is_doc_source, expected_suffix) in chunk {
+                        let Ok(raw_content) = fs::read_to_string(file_path) else {
+                            continue;
+                        };
+                        let raw_len = raw_content.len();
+                        let raw_hash =
+                            blake3::hash(raw_content.as_bytes()).to_hex().to_string();
+                        let new_hash = format!("{raw_hash}{expected_suffix}");
+
+                        if existing_hashes.get(index_key).map(|h| h.as_str())
+                            == Some(new_hash.as_str())
+                        {
+                            out.push((index_key.clone(), raw_len, true, None));
+                            continue;
+                        }
+
+                        if let Ok(Some(mut parsed)) = parse_file_content(file_path, &raw_content) {
+                            if *is_doc_source {
+                                attach_full_code_doc_section(file_path, &raw_content, &mut parsed);
+                            }
+                            out.push((
+                                index_key.clone(),
+                                raw_len,
+                                false,
+                                Some((new_hash, parsed)),
+                            ));
+                        } else {
+                            out.push((index_key.clone(), raw_len, false, None));
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .collect()
+    });
+
+    batches.into_iter().flatten().collect()
+}
+
+/// Scans and lazily indexes all supported code and Markdown files in `subpath` + workspace docs into `local_db`.
+/// Global docs are indexed once in `~/.config/lee/global.db` via `index_global_docs` to avoid per-repo duplication.
 pub fn index_workspace(
     conn: &mut Connection,
     paths: &AppPaths,
     subpath: Option<&str>,
 ) -> Result<IndexStats> {
     let start_instant = Instant::now();
-    // shortcut: global docs index into each workspace's local_db (mtime+blake3 cached); split to global_db if many repos share huge global doc trees
+    let ws_docs = paths.workspace_doc_paths();
     let all_docs = paths.all_doc_paths();
 
     let scan_root = match subpath {
@@ -180,7 +247,7 @@ pub fn index_workspace(
 
     let include_sources = subpath.is_none() || subpath == Some(".");
     let extra_sources = if include_sources {
-        all_docs.as_slice()
+        ws_docs.as_slice()
     } else {
         &[]
     };
@@ -218,12 +285,10 @@ pub fn index_workspace(
         let index_key = to_index_path(&paths.project_root, file_path);
         seen_keys.insert(index_key.clone());
 
-        let is_doc_source = is_under_doc_paths(file_path, &all_docs);
+        let is_doc_source = is_under_doc_paths(file_path, &ws_docs);
         let expected_suffix =
             expected_hash_suffix(IndexedFileType::classify(file_path), is_doc_source);
 
-        // Fast-path: if file mtime is strictly older than last_indexed (at least 1s earlier)
-        // and the stored hash already carries the current schema suffix, skip disk read + blake3
         if let Some((old_hash, last_idx, line_cnt)) = existing_db_map.get(&index_key)
             && (expected_suffix.is_empty() || old_hash.ends_with(expected_suffix))
             && let Ok(meta) = fs::metadata(file_path)
@@ -241,77 +306,20 @@ pub fn index_workspace(
     }
 
     if !to_check.is_empty() {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(to_check.len())
-            .max(1);
-        let chunk_size = to_check.len().div_ceil(workers);
-        let existing_ref = &existing_db_map;
-
-        let batch_results: Vec<
-            Vec<(usize, bool, Option<(String, String, parser::ParsedFileResult)>)>,
-        > = std::thread::scope(|s| {
-            let handles: Vec<_> = to_check
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    s.spawn(move || {
-                        let mut out = Vec::with_capacity(chunk.len());
-                        for (file_path, index_key, is_doc_source, expected_suffix) in chunk {
-                            let Ok(raw_content) = fs::read_to_string(file_path) else {
-                                continue;
-                            };
-                            let raw_len = raw_content.len();
-                            let raw_hash =
-                                blake3::hash(raw_content.as_bytes()).to_hex().to_string();
-                            let new_hash = format!("{raw_hash}{expected_suffix}");
-
-                            if existing_ref.get(index_key).map(|(h, _, _)| h.as_str())
-                                == Some(new_hash.as_str())
-                            {
-                                out.push((raw_len, true, None));
-                                continue;
-                            }
-
-                            if let Ok(Some(mut parsed)) =
-                                parse_file_content(file_path, &raw_content)
-                            {
-                                if *is_doc_source {
-                                    attach_full_code_doc_section(
-                                        file_path,
-                                        &raw_content,
-                                        &mut parsed,
-                                    );
-                                }
-                                out.push((
-                                    raw_len,
-                                    false,
-                                    Some((index_key.clone(), new_hash, parsed)),
-                                ));
-                            } else {
-                                out.push((raw_len, false, None));
-                            }
-                        }
-                        out
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .filter_map(|h| h.join().ok())
-                .collect()
-        });
-
-        for batch in batch_results {
-            for (raw_len, is_cached, parsed_opt) in batch {
-                stats.files_scanned += 1;
-                stats.total_raw_bytes += raw_len;
-                if is_cached {
-                    stats.files_cached += 1;
-                } else if let Some((index_key, new_hash, parsed)) = parsed_opt {
-                    stats.files_reindexed += 1;
-                    upsert_parsed_file(&tx, &index_key, &new_hash, &parsed)?;
-                }
+        let existing_hashes: HashMap<String, String> = existing_db_map
+            .iter()
+            .map(|(k, (h, _, _))| (k.clone(), h.clone()))
+            .collect();
+        for (index_key, raw_len, is_cached, parsed_opt) in
+            parse_files_parallel(&to_check, &existing_hashes)
+        {
+            stats.files_scanned += 1;
+            stats.total_raw_bytes += raw_len;
+            if is_cached {
+                stats.files_cached += 1;
+            } else if let Some((new_hash, parsed)) = parsed_opt {
+                stats.files_reindexed += 1;
+                upsert_parsed_file(&tx, &index_key, &new_hash, &parsed)?;
             }
         }
     }
@@ -358,6 +366,121 @@ pub fn index_workspace(
     Ok(stats)
 }
 
+/// Indexes all registered global docs once into `~/.config/lee/global.db` (shared across all workspaces).
+pub fn index_global_docs(paths: &AppPaths) -> Result<IndexStats> {
+    let start_instant = Instant::now();
+    let global_docs = paths.global_doc_paths();
+    if global_docs.is_empty() && !paths.global_db.exists() {
+        return Ok(IndexStats::default());
+    }
+
+    paths.ensure_global_dirs()?;
+    let mut conn = init_connection(&paths.global_db)?;
+    let files = if let Some((first, rest)) = global_docs.split_first() {
+        collect_workspace_files(first, rest)
+    } else {
+        Vec::new()
+    };
+
+    let mut stats = IndexStats::default();
+    let mut seen_keys: HashSet<String> = HashSet::with_capacity(files.len());
+
+    let tx = conn.transaction()?;
+    let existing_db_map: HashMap<String, (String, i64, usize)> = {
+        let mut stmt = tx.prepare_cached(
+            "SELECT file_path, blake3_hash, last_indexed, line_count FROM file_hashes",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3).unwrap_or(1) as usize,
+                    ),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+
+    let mut to_check: Vec<(PathBuf, String, bool, &'static str)> = Vec::new();
+    for file_path in &files {
+        let index_key = file_path.to_string_lossy().to_string();
+        seen_keys.insert(index_key.clone());
+
+        let expected_suffix = expected_hash_suffix(IndexedFileType::classify(file_path), true);
+        if let Some((old_hash, last_idx, line_cnt)) = existing_db_map.get(&index_key)
+            && (expected_suffix.is_empty() || old_hash.ends_with(expected_suffix))
+            && let Ok(meta) = fs::metadata(file_path)
+            && let Ok(mtime) = meta.modified()
+            && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
+            && (dur.as_secs() as i64) < *last_idx
+        {
+            stats.files_scanned += 1;
+            stats.files_cached += 1;
+            stats.total_raw_bytes += (meta.len() as usize).max(line_cnt * 40);
+            continue;
+        }
+        to_check.push((file_path.clone(), index_key, true, expected_suffix));
+    }
+
+    if !to_check.is_empty() {
+        let existing_hashes: HashMap<String, String> = existing_db_map
+            .iter()
+            .map(|(k, (h, _, _))| (k.clone(), h.clone()))
+            .collect();
+        for (index_key, raw_len, is_cached, parsed_opt) in
+            parse_files_parallel(&to_check, &existing_hashes)
+        {
+            stats.files_scanned += 1;
+            stats.total_raw_bytes += raw_len;
+            if is_cached {
+                stats.files_cached += 1;
+            } else if let Some((new_hash, parsed)) = parsed_opt {
+                stats.files_reindexed += 1;
+                upsert_parsed_file(&tx, &index_key, &new_hash, &parsed)?;
+            }
+        }
+    }
+
+    {
+        let mut del_stmt = tx.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?;
+        for db_path in existing_db_map.keys() {
+            if !seen_keys.contains(db_path) {
+                del_stmt.execute(params![db_path])?;
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    stats.code_symbols = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE kind != 'md_heading'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    stats.md_headings = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE kind = 'md_heading'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    stats.doc_sections = conn
+        .query_row("SELECT COUNT(*) FROM doc_sections_meta", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize;
+    stats.elapsed_ms = start_instant.elapsed().as_millis();
+
+    Ok(stats)
+}
+
 #[derive(Debug, Clone)]
 pub struct DocUpdateReport {
     pub scope: DocScope,
@@ -382,13 +505,12 @@ fn path_belongs_to_doc(file_path: &str, doc_key: &str) -> bool {
     file_path == key || file_path.starts_with(&format!("{key}/"))
 }
 
-/// Incrementally updates registered workspace & global docs in SQLite.
-/// Docs with no added, modified, or removed files are skipped without writing to the DB.
-pub fn update_registered_docs(
+fn update_docs_in_conn(
     conn: &mut Connection,
-    paths: &AppPaths,
+    project_root: Option<&Path>,
     docs: &[(DocScope, DocEntry)],
-) -> Result<Vec<DocUpdateReport>> {
+    reports: &mut Vec<DocUpdateReport>,
+) -> Result<()> {
     let existing_db_map: HashMap<String, (String, i64)> = {
         let mut stmt = conn.prepare("SELECT file_path, blake3_hash, last_indexed FROM file_hashes")?;
         let rows = stmt
@@ -402,8 +524,10 @@ pub fn update_registered_docs(
             .collect();
         rows
     };
-
-    let mut reports = Vec::with_capacity(docs.len());
+    let existing_hashes: HashMap<String, String> = existing_db_map
+        .iter()
+        .map(|(k, (h, _))| (k.clone(), h.clone()))
+        .collect();
 
     for (scope, entry) in docs {
         if !entry.path.exists() {
@@ -421,20 +545,23 @@ pub fn update_registered_docs(
             continue;
         }
 
-        let doc_key = to_index_path(&paths.project_root, &entry.path);
+        let doc_key = match project_root {
+            Some(root) => to_index_path(root, &entry.path),
+            None => entry.path.to_string_lossy().to_string(),
+        };
         let files = collect_workspace_files(&entry.path, &[]);
         let mut seen_keys: HashSet<String> = HashSet::with_capacity(files.len());
-        let mut to_upsert: Vec<(String, String, parser::ParsedFileResult)> = Vec::new();
-        let mut added = 0usize;
-        let mut updated = 0usize;
+        let mut to_check: Vec<(PathBuf, String, bool, &'static str)> = Vec::new();
         let mut unchanged = 0usize;
 
         for file_path in &files {
-            let index_key = to_index_path(&paths.project_root, file_path);
+            let index_key = match project_root {
+                Some(root) => to_index_path(root, file_path),
+                None => file_path.to_string_lossy().to_string(),
+            };
             seen_keys.insert(index_key.clone());
 
             let expected_suffix = expected_hash_suffix(IndexedFileType::classify(file_path), true);
-
             if let Some((old_hash, last_idx)) = existing_db_map.get(&index_key)
                 && (expected_suffix.is_empty() || old_hash.ends_with(expected_suffix))
                 && let Ok(meta) = fs::metadata(file_path)
@@ -445,28 +572,25 @@ pub fn update_registered_docs(
                 unchanged += 1;
                 continue;
             }
+            to_check.push((file_path.clone(), index_key, true, expected_suffix));
+        }
 
-            let Ok(raw_content) = fs::read_to_string(file_path) else {
-                continue;
-            };
-            let raw_hash = blake3::hash(raw_content.as_bytes()).to_hex().to_string();
-            let new_hash = format!("{raw_hash}{expected_suffix}");
+        let mut to_upsert: Vec<(String, String, parser::ParsedFileResult)> = Vec::new();
+        let mut added = 0usize;
+        let mut updated = 0usize;
 
-            match existing_db_map.get(&index_key).map(|(h, _)| h.as_str()) {
-                Some(h) if h == new_hash.as_str() => {
-                    unchanged += 1;
+        for (index_key, _raw_len, is_cached, parsed_opt) in
+            parse_files_parallel(&to_check, &existing_hashes)
+        {
+            if is_cached {
+                unchanged += 1;
+            } else if let Some((new_hash, parsed)) = parsed_opt {
+                if existing_db_map.contains_key(&index_key) {
+                    updated += 1;
+                } else {
+                    added += 1;
                 }
-                existing => {
-                    if let Some(mut parsed) = parse_file_content(file_path, &raw_content)? {
-                        attach_full_code_doc_section(file_path, &raw_content, &mut parsed);
-                        if existing.is_some() {
-                            updated += 1;
-                        } else {
-                            added += 1;
-                        }
-                        to_upsert.push((index_key, new_hash, parsed));
-                    }
-                }
+                to_upsert.push((index_key, new_hash, parsed));
             }
         }
 
@@ -502,7 +626,38 @@ pub fn update_registered_docs(
             unchanged,
         });
     }
+    Ok(())
+}
 
+/// Incrementally updates registered workspace docs (in `local_db`) and global docs (in `global_db`).
+/// Docs with no added, modified, or removed files are skipped without writing to SQLite.
+pub fn update_registered_docs(
+    local_conn: Option<&mut Connection>,
+    paths: &AppPaths,
+    docs: &[(DocScope, DocEntry)],
+) -> Result<Vec<DocUpdateReport>> {
+    let ws_docs: Vec<(DocScope, DocEntry)> = docs
+        .iter()
+        .filter(|(s, _)| *s == DocScope::Workspace)
+        .cloned()
+        .collect();
+    let gl_docs: Vec<(DocScope, DocEntry)> = docs
+        .iter()
+        .filter(|(s, _)| *s == DocScope::Global)
+        .cloned()
+        .collect();
+
+    let mut reports = Vec::with_capacity(docs.len());
+    if !ws_docs.is_empty()
+        && let Some(lconn) = local_conn
+    {
+        update_docs_in_conn(lconn, Some(&paths.project_root), &ws_docs, &mut reports)?;
+    }
+    if !gl_docs.is_empty() {
+        paths.ensure_global_dirs()?;
+        let mut gconn = init_connection(&paths.global_db)?;
+        update_docs_in_conn(&mut gconn, None, &gl_docs, &mut reports)?;
+    }
     Ok(reports)
 }
 
@@ -973,6 +1128,16 @@ pub fn build_project_map(
                 |r| r.get::<_, i64>(0),
             )
             .unwrap_or(0) as usize;
+        if paths.global_db.exists()
+            && let Ok(gconn) = init_connection(&paths.global_db)
+        {
+            ext_file_count += gconn
+                .query_row("SELECT COUNT(*) FROM file_hashes", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0) as usize;
+            ext_symbol_count += gconn
+                .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0) as usize;
+        }
     }
 
     let file_ranks = compute_file_pagerank(conn);
@@ -1988,13 +2153,32 @@ mod tests {
 
         let mut conn = init_connection(&paths.local_db).unwrap();
 
-        // First sync: both docs add their initial files
-        let first = update_registered_docs(&mut conn, &paths, &docs).unwrap();
+        // First sync: workspace doc goes to local_db, global doc goes to global_db (zero duplication!)
+        let first = update_registered_docs(Some(&mut conn), &paths, &docs).unwrap();
         assert_eq!(first[0].added, 2);
         assert_eq!(first[1].added, 1);
 
+        let local_gl_cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_hashes WHERE file_path LIKE '%g.mdx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_gl_cnt, 0, "global doc must not be duplicated in local_db");
+
+        let gconn = init_connection(&paths.global_db).unwrap();
+        let global_gl_cnt: i64 = gconn
+            .query_row(
+                "SELECT COUNT(*) FROM file_hashes WHERE file_path LIKE '%g.mdx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(global_gl_cnt, 1, "global doc must live in global_db");
+
         // Second sync with no changes: both docs skipped
-        let second = update_registered_docs(&mut conn, &paths, &docs).unwrap();
+        let second = update_registered_docs(Some(&mut conn), &paths, &docs).unwrap();
         assert!(!second[0].has_changes());
         assert!(!second[1].has_changes());
 
@@ -2003,7 +2187,7 @@ mod tests {
         fs::write(ws_doc.join("b.mdx"), "# Beta\nBrand new file.\n").unwrap();
         fs::remove_file(ws_doc.join("old.mdx")).unwrap();
 
-        let third = update_registered_docs(&mut conn, &paths, &docs).unwrap();
+        let third = update_registered_docs(Some(&mut conn), &paths, &docs).unwrap();
         assert_eq!(third[0].added, 1);
         assert_eq!(third[0].updated, 1);
         assert_eq!(third[0].removed, 1);

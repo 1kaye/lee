@@ -2,7 +2,7 @@ pub mod fts;
 
 use crate::config::{normalize_doc_name, AppPaths, DocEntry};
 use crate::db::{init_connection, now_unix};
-use crate::indexer::index_workspace;
+use crate::indexer::{index_global_docs, index_workspace};
 use crate::memory::fts::{search_doc_sections_fts, search_memories_fts};
 use crate::security::to_index_path;
 use anyhow::{bail, Context, Result};
@@ -438,7 +438,6 @@ fn load_linked_memories(
 
 #[derive(Debug, Clone)]
 struct DocSectionRecord {
-    id: i64,
     file_path: String,
     heading: String,
     start_line: i64,
@@ -472,8 +471,69 @@ fn match_named_docs<'a>(entries: &'a [DocEntry], query_name: &str) -> Vec<&'a Do
         .collect()
 }
 
+fn collect_doc_sections_from_db<F>(
+    conn: &Connection,
+    query: &str,
+    matches_file: &F,
+    matched_sections: &mut Vec<DocSectionRecord>,
+    seen_keys: &mut HashSet<(String, i64, i64)>,
+) -> Result<()>
+where
+    F: Fn(&str) -> bool,
+{
+    let fts_ids = search_doc_sections_fts(conn, query, 100).unwrap_or_default();
+    if !fts_ids.is_empty() {
+        let mut by_id = conn.prepare_cached(
+            "SELECT file_path, heading, start_line, end_line, content
+             FROM doc_sections_meta WHERE id = ?1",
+        )?;
+        for id in fts_ids {
+            if let Ok(sec) = by_id.query_row(params![id], |r| {
+                Ok(DocSectionRecord {
+                    file_path: r.get(0)?,
+                    heading: r.get(1)?,
+                    start_line: r.get(2)?,
+                    end_line: r.get(3)?,
+                    content: r.get(4)?,
+                })
+            }) && matches_file(&sec.file_path)
+                && seen_keys.insert((sec.file_path.clone(), sec.start_line, sec.end_line))
+            {
+                matched_sections.push(sec);
+            }
+        }
+    }
+
+    if matched_sections.len() < 8 {
+        let like_pat = format!("%{}%", query.trim().to_lowercase());
+        let mut like_stmt = conn.prepare(
+            "SELECT file_path, heading, start_line, end_line, content
+             FROM doc_sections_meta
+             WHERE LOWER(heading) LIKE ?1 OR LOWER(file_path) LIKE ?1 OR LOWER(content) LIKE ?1
+             LIMIT 80",
+        )?;
+        let rows = like_stmt.query_map(params![like_pat], |r| {
+            Ok(DocSectionRecord {
+                file_path: r.get(0)?,
+                heading: r.get(1)?,
+                start_line: r.get(2)?,
+                end_line: r.get(3)?,
+                content: r.get(4)?,
+            })
+        })?;
+        for sec in rows.flatten() {
+            if matches_file(&sec.file_path)
+                && seen_keys.insert((sec.file_path.clone(), sec.start_line, sec.end_line))
+            {
+                matched_sections.push(sec);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Tool 5: `search_docs` — column-weighted SQLite FTS5 BM25 search across `.md`/`.mdx` sections
-/// and full code files in workspace & global docs (no full-table scan).
+/// and full code files in workspace (`local_db`) & global (`global_db`) docs.
 pub fn search_docs(
     conn: &mut Connection,
     paths: &AppPaths,
@@ -483,8 +543,6 @@ pub fn search_docs(
     scope: Option<&str>,
     budget_tokens: usize,
 ) -> Result<(String, usize)> {
-    let _ = index_workspace(conn, paths, None)?;
-
     let scope_mode = match scope.map(|s| s.trim().to_lowercase()).as_deref() {
         None | Some("") | Some("all") => "all",
         Some("workspace") | Some("w") | Some("local") | Some("project") => "workspace",
@@ -494,6 +552,13 @@ pub fn search_docs(
 
     let ws_docs = paths.load_config().unwrap_or_default().docs;
     let global_docs = paths.load_global_config().unwrap_or_default().docs;
+
+    if scope_mode != "global" {
+        let _ = index_workspace(conn, paths, None)?;
+    }
+    if scope_mode != "workspace" && !global_docs.is_empty() {
+        let _ = index_global_docs(paths)?;
+    }
 
     let doc_trim = doc_name.map(|s| s.trim()).filter(|s| !s.is_empty());
     let allowed_doc_keys: Option<Vec<String>> = if let Some(dname) = doc_trim {
@@ -505,7 +570,7 @@ pub fn search_docs(
         }
         if scope_mode != "workspace" {
             for e in match_named_docs(&global_docs, dname) {
-                matched_paths.push(to_index_path(&paths.project_root, &e.path));
+                matched_paths.push(e.path.to_string_lossy().to_string());
             }
         }
         if matched_paths.is_empty() {
@@ -536,7 +601,7 @@ pub fn search_docs(
         Some(
             global_docs
                 .iter()
-                .map(|e| to_index_path(&paths.project_root, &e.path))
+                .map(|e| e.path.to_string_lossy().to_string())
                 .collect(),
         )
     } else if scope_mode == "workspace" {
@@ -588,57 +653,28 @@ pub fn search_docs(
         true
     };
 
-    // 1. Fetch FTS5 BM25 ranked IDs and look up only those rows by primary key (O(k) index lookup)
-    let fts_ids = search_doc_sections_fts(conn, query, 100).unwrap_or_default();
     let mut matched_sections: Vec<DocSectionRecord> = Vec::new();
-    let mut seen_ids: HashSet<i64> = HashSet::new();
+    let mut seen_keys: HashSet<(String, i64, i64)> = HashSet::new();
 
-    if !fts_ids.is_empty() {
-        let mut by_id = conn.prepare_cached(
-            "SELECT id, file_path, heading, start_line, end_line, content
-             FROM doc_sections_meta WHERE id = ?1",
+    if scope_mode != "global" {
+        collect_doc_sections_from_db(
+            conn,
+            query,
+            &matches_file,
+            &mut matched_sections,
+            &mut seen_keys,
         )?;
-        for id in fts_ids {
-            if let Ok(sec) = by_id.query_row(params![id], |r| {
-                Ok(DocSectionRecord {
-                    id: r.get(0)?,
-                    file_path: r.get(1)?,
-                    heading: r.get(2)?,
-                    start_line: r.get(3)?,
-                    end_line: r.get(4)?,
-                    content: r.get(5)?,
-                })
-            }) && matches_file(&sec.file_path)
-                && seen_ids.insert(sec.id)
-            {
-                matched_sections.push(sec);
-            }
-        }
     }
 
-    // 2. Bounded SQL LIKE fallback only if FTS5 yielded fewer than 8 filtered results
-    if matched_sections.len() < 8 {
-        let like_pat = format!("%{}%", query.trim().to_lowercase());
-        let mut like_stmt = conn.prepare(
-            "SELECT id, file_path, heading, start_line, end_line, content
-             FROM doc_sections_meta
-             WHERE LOWER(heading) LIKE ?1 OR LOWER(file_path) LIKE ?1 OR LOWER(content) LIKE ?1
-             LIMIT 80",
-        )?;
-        let rows = like_stmt.query_map(params![like_pat], |r| {
-            Ok(DocSectionRecord {
-                id: r.get(0)?,
-                file_path: r.get(1)?,
-                heading: r.get(2)?,
-                start_line: r.get(3)?,
-                end_line: r.get(4)?,
-                content: r.get(5)?,
-            })
-        })?;
-        for sec in rows.flatten() {
-            if matches_file(&sec.file_path) && seen_ids.insert(sec.id) {
-                matched_sections.push(sec);
-            }
+    if scope_mode != "workspace" && !global_docs.is_empty() && paths.global_db.exists() {
+        if let Ok(global_conn) = init_connection(&paths.global_db) {
+            let _ = collect_doc_sections_from_db(
+                &global_conn,
+                query,
+                &matches_file,
+                &mut matched_sections,
+                &mut seen_keys,
+            );
         }
     }
 
