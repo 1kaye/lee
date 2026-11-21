@@ -99,7 +99,6 @@ pub struct AppPaths {
     pub global_dir: PathBuf,
     pub global_db: PathBuf,
     pub global_config_file: PathBuf,
-    pub models_dir: PathBuf,
     pub vault_dir: PathBuf,
 }
 
@@ -133,7 +132,6 @@ impl AppPaths {
 
         let global_db = global_dir.join(GLOBAL_DB_FILE_NAME);
         let global_config_file = global_dir.join(CONFIG_FILE_NAME);
-        let models_dir = global_dir.join("models");
         let vault_dir = global_dir.join("vault");
 
         Ok(Self {
@@ -145,7 +143,6 @@ impl AppPaths {
             global_dir,
             global_db,
             global_config_file,
-            models_dir,
             vault_dir,
         })
     }
@@ -232,8 +229,6 @@ impl AppPaths {
     pub fn ensure_global_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.global_dir)
             .with_context(|| format!("Failed to create {}", self.global_dir.display()))?;
-        fs::create_dir_all(&self.models_dir)
-            .with_context(|| format!("Failed to create {}", self.models_dir.display()))?;
         fs::create_dir_all(&self.vault_dir)
             .with_context(|| format!("Failed to create {}", self.vault_dir.display()))?;
         Ok(())

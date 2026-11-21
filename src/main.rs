@@ -17,13 +17,10 @@ use crate::hooks::{
     auto_sync_agents_md, discover_missed_savings, install_antigravity_hook_plugin,
     process_antigravity_hook, process_claude_hook,
 };
-use crate::indexer::{index_workspace, purge_source_from_db};
+use crate::indexer::{index_workspace, purge_source_from_db, update_registered_docs};
 use crate::mcp::protocol::mcp_schema_overhead_bytes;
 use crate::mcp::run_stdio_server;
-use crate::memory::embedder::{download_and_verify_model, is_model_cached};
-use crate::memory::{
-    backfill_missing_memory_embeddings, list_backlog_and_handoff, recall_memories_hybrid,
-};
+use crate::memory::{list_backlog_and_handoff, recall_memories};
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
@@ -47,14 +44,11 @@ struct Cli {
 enum Commands {
     /// Run the JSON-RPC 2.0 MCP server over stdin/stdout
     Serve,
-    /// Initialize .lee/, .lee/.notes/, PreToolUse hook, SQLite schemas, and BAAI/bge-small-en-v1.5 model cache
+    /// Initialize .lee/, .lee/.notes/, PreToolUse hook, and SQLite FTS5 schemas
     Init {
         /// Also initialize global vault, database, and hook in ~/.config/lee & ~/.gemini/config/plugins/lee
         #[arg(long)]
         global: bool,
-        /// Skip downloading the BGE-Small ONNX model (uses FTS5 BM25 lexical fallback until downloaded)
-        #[arg(long)]
-        skip_model: bool,
     },
     /// Execute a shell command and compress its output via `run_digest` (used by PreToolUse hooks or CLI)
     Exec {
@@ -77,8 +71,10 @@ enum Commands {
         #[arg(short = 'g', long = "global", visible_alias = "g", conflicts_with = "workspace")]
         global: bool,
     },
-    /// List registered workspace and global docs (use `--json` for LLM/machine output)
+    /// List or incrementally update registered workspace and global docs
     Docs {
+        #[command(subcommand)]
+        action: Option<DocsAction>,
         /// Output machine-readable JSON (for LLMs and scripts)
         #[arg(long)]
         json: bool,
@@ -100,7 +96,7 @@ enum Commands {
     },
     /// Scan and index all project source code and Markdown documentation files in parallel
     Index,
-    /// Show current workspace index status, model cache status, and registered external sources
+    /// Show current workspace index status and registered docs
     Status,
     /// Display token-saving audit table and net token report (supports `--daily` and `--history`)
     Stats {
@@ -134,6 +130,12 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum DocsAction {
+    /// Incrementally update changed, new, or deleted files in workspace & global docs (skips unchanged docs)
+    Update,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum HookEvent {
     Prompt,
@@ -153,7 +155,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Serve => run_stdio_server(&paths),
-        Commands::Init { global, skip_model } => cmd_init(&paths, global, skip_model),
+        Commands::Init { global } => cmd_init(&paths, global),
         Commands::Exec { command } => cmd_exec(&paths, &command),
         Commands::AddDocs {
             path,
@@ -169,7 +171,10 @@ fn main() -> Result<()> {
             };
             cmd_add_docs(&paths, &path, name.as_deref(), scope)
         }
-        Commands::Docs { json } => cmd_docs(&paths, json),
+        Commands::Docs { action, json } => match action {
+            Some(DocsAction::Update) => cmd_docs_update(&paths),
+            None => cmd_docs(&paths, json),
+        },
         Commands::RemoveDocs {
             target,
             workspace,
@@ -195,7 +200,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_init(paths: &AppPaths, global: bool, skip_model: bool) -> Result<()> {
+fn cmd_init(paths: &AppPaths, global: bool) -> Result<()> {
     paths.ensure_local_dirs()?;
     paths.ensure_global_dirs()?;
     paths.ensure_gitignore(&[".lee/", ".agents/plugins/lee/"])?;
@@ -218,11 +223,9 @@ fn cmd_init(paths: &AppPaths, global: bool, skip_model: bool) -> Result<()> {
     paths.save_config(&cfg)?;
 
     let mut local_conn = init_connection(&paths.local_db)?;
-    let global_conn = if global || !paths.global_db.exists() {
-        Some(init_connection(&paths.global_db)?)
-    } else {
-        None
-    };
+    if global || !paths.global_db.exists() {
+        let _ = init_connection(&paths.global_db)?;
+    }
 
     println!(
         "[lee] Initialized local workspace at {}",
@@ -236,27 +239,6 @@ fn cmd_init(paths: &AppPaths, global: bool, skip_model: bool) -> Result<()> {
         "[lee] Global directory ready at {}",
         paths.global_dir.display()
     );
-
-    if !skip_model {
-        println!(
-            "[lee] Verifying / downloading BAAI/bge-small-en-v1.5 (BGESmallENV15Q) in {}...",
-            paths.models_dir.display()
-        );
-        match download_and_verify_model(&paths.models_dir, true) {
-            Ok(()) => {
-                println!(
-                    "[lee] Model BGESmallENV15Q (384-dim) ready for offline inference."
-                );
-                let _ = backfill_missing_memory_embeddings(&local_conn, &paths.models_dir);
-                if let Some(ref gconn) = global_conn {
-                    let _ = backfill_missing_memory_embeddings(gconn, &paths.models_dir);
-                }
-            }
-            Err(e) => eprintln!(
-                "[lee] Warning: could not download BGE model now ({e}). Hybrid search will gracefully fallback to SQLite FTS5 BM25 until online."
-            ),
-        }
-    }
 
     let stats = index_workspace(&mut local_conn, paths, None)?;
     println!(
@@ -392,6 +374,67 @@ fn cmd_docs(paths: &AppPaths, as_json: bool) -> Result<()> {
             println!("  [{}] {} -> {}", i + 1, doc.name, doc.path.display());
         }
     }
+    Ok(())
+}
+
+fn cmd_docs_update(paths: &AppPaths) -> Result<()> {
+    let start = std::time::Instant::now();
+    let ws_docs = paths.load_config().unwrap_or_default().docs;
+    let global_docs = paths.load_global_config().unwrap_or_default().docs;
+
+    let mut all_docs: Vec<(DocScope, DocEntry)> = Vec::with_capacity(ws_docs.len() + global_docs.len());
+    for doc in ws_docs {
+        all_docs.push((DocScope::Workspace, doc));
+    }
+    for doc in global_docs {
+        all_docs.push((DocScope::Global, doc));
+    }
+
+    if all_docs.is_empty() {
+        println!("[lee] No workspace or global docs registered. Use `lee add-docs <path>` first.");
+        return Ok(());
+    }
+
+    paths.ensure_local_dirs()?;
+    let mut conn = init_connection(&paths.local_db)?;
+    let reports = update_registered_docs(&mut conn, paths, &all_docs)?;
+
+    let mut updated_docs = 0usize;
+    let mut skipped_docs = 0usize;
+    for r in &reports {
+        if r.missing {
+            println!(
+                "  - [{}] {}: missing path ({})",
+                r.scope.as_str(),
+                r.name,
+                r.path.display()
+            );
+        } else if r.has_changes() {
+            updated_docs += 1;
+            println!(
+                "  - [{}] {}: updated (+{} new, ~{} modified, -{} removed | {} files)",
+                r.scope.as_str(),
+                r.name,
+                r.added,
+                r.updated,
+                r.removed,
+                r.files_scanned
+            );
+        } else {
+            skipped_docs += 1;
+            println!(
+                "  - [{}] {}: unchanged ({} files, skipped)",
+                r.scope.as_str(),
+                r.name,
+                r.files_scanned
+            );
+        }
+    }
+
+    println!(
+        "[lee] Docs update finished in {} ms ({updated_docs} updated, {skipped_docs} unchanged).",
+        start.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -548,12 +591,6 @@ fn cmd_remove_docs(
 fn cmd_index(paths: &AppPaths) -> Result<()> {
     paths.ensure_local_dirs()?;
     let mut conn = init_connection(&paths.local_db)?;
-    let _ = backfill_missing_memory_embeddings(&conn, &paths.models_dir);
-    if paths.global_db.exists() {
-        if let Ok(gconn) = init_connection(&paths.global_db) {
-            let _ = backfill_missing_memory_embeddings(&gconn, &paths.models_dir);
-        }
-    }
     let stats = index_workspace(&mut conn, paths, None)?;
     println!(
         "[lee] Indexed {} files ({} re-indexed, {} cached) | {} code symbols | {} symbol refs | {} md headings | {} doc sections in {} ms.",
@@ -572,7 +609,6 @@ fn cmd_index(paths: &AppPaths) -> Result<()> {
 fn cmd_status(paths: &AppPaths) -> Result<()> {
     let ws_docs = paths.load_config().unwrap_or_default().docs;
     let global_docs = paths.load_global_config().unwrap_or_default().docs;
-    let model_ready = is_model_cached(&paths.models_dir);
 
     println!("=== lee Status ===");
     println!("Project Root : {}", paths.project_root.display());
@@ -586,15 +622,6 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
         }
     );
     println!("Global Vault : {}", paths.vault_dir.display());
-    println!(
-        "BGE Model    : {} ({})",
-        paths.models_dir.display(),
-        if model_ready {
-            "BGESmallENV15Q cached & offline-ready"
-        } else {
-            "not cached (using FTS5 BM25 fallback)"
-        }
-    );
 
     if ws_docs.is_empty() {
         println!("Workspace Docs: (none)");
@@ -897,7 +924,7 @@ fn cmd_hook(paths: &AppPaths, event: HookEvent, query: Option<&str>) -> Result<(
             if q_trimmed.is_empty() {
                 return Ok(());
             }
-            let (out, raw_bytes) = recall_memories_hybrid(&conn, paths, q_trimmed, 600)?;
+            let (out, raw_bytes) = recall_memories(&conn, paths, q_trimmed, 600)?;
             let _ = record_token_metric(&conn, "hook_prompt", raw_bytes, out.len());
             print!("{out}");
         }
@@ -939,7 +966,13 @@ mod tests {
         ));
 
         let cli = Cli::try_parse_from(["lee", "docs", "--json"]).unwrap();
-        assert!(matches!(cli.command, Commands::Docs { json: true }));
+        assert!(matches!(cli.command, Commands::Docs { action: None, json: true }));
+
+        let cli = Cli::try_parse_from(["lee", "docs", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Docs { action: Some(DocsAction::Update), .. }
+        ));
 
         let cli = Cli::try_parse_from(["lee", "rm-docs", "--g", "gpui kit"]).unwrap();
         assert!(matches!(

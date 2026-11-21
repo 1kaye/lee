@@ -4,7 +4,7 @@ use crate::digest::{recall_handle, run_command_digest};
 use crate::indexer::{
     build_outline, build_project_map, find_symbol_references, read_symbol_range, smart_grep_search,
 };
-use crate::memory::{recall_memories_hybrid, search_docs_hybrid, store_memory};
+use crate::memory::{recall_memories, search_docs, store_memory};
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -130,7 +130,7 @@ fn execute_tool(
                 .get("budget_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(800) as usize;
-            search_docs_hybrid(conn, paths, query, file_filter, doc_name, scope, budget_tokens)
+            search_docs(conn, paths, query, file_filter, doc_name, scope, budget_tokens)
         }
         "smart_grep" => {
             let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
@@ -212,7 +212,7 @@ fn execute_tool(
                 .get("budget_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(600) as usize;
-            recall_memories_hybrid(conn, paths, query, budget_tokens)
+            recall_memories(conn, paths, query, budget_tokens)
         }
         other => bail!("Unknown MCP tool '{other}'"),
     }

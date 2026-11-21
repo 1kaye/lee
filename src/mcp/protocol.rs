@@ -116,7 +116,7 @@ pub fn mcp_tools_list() -> Value {
             },
             {
                 "name": "search_docs",
-                "description": "Hybrid FTS5 BM25 + BGE-Small (RRF) search over workspace & global registered docs (.md files).",
+                "description": "SQLite FTS5 BM25 search over workspace & global registered docs (.md/.mdx sections and full code files).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -176,7 +176,7 @@ pub fn mcp_tools_list() -> Value {
             },
             {
                 "name": "remember",
-                "description": "Append decision, rule, session handoff, or backlog item to Markdown (.lee/.notes/ or global vault) with [[wikilinks]] & BGE index.",
+                "description": "Append decision, rule, session handoff, or backlog item to Markdown (.lee/.notes/ or global vault) with [[wikilinks]] & FTS5 index.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -190,7 +190,7 @@ pub fn mcp_tools_list() -> Value {
             },
             {
                 "name": "recall_memory",
-                "description": "Hybrid FTS5 BM25 + BGE-Small (cos_floor=0.53, RRF) recall over project/global/handoff/backlog memories + 1-hop [[wikilinks]].",
+                "description": "SQLite FTS5 BM25 recall over project/global/handoff/backlog memories + 1-hop [[wikilinks]].",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

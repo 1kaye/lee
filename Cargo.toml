@@ -3,7 +3,7 @@ name = "lee"
 version = "0.1.0"
 edition = "2024"
 default-run = "lee"
-description = "Locate Exact Elements — Local token-saving MCP server, AST code & Markdown indexer, output digest engine, and BGE hybrid memory store for AI coding agents."
+description = "Locate Exact Elements — Local token-saving MCP server, AST code & Markdown indexer, output digest engine, and SQLite FTS5 memory store for AI coding agents."
 license = "MIT"
 
 [[bin]]
@@ -16,7 +16,6 @@ clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
-thiserror = "2.0"
 
 # Local Database (Bundled SQLite includes FTS5 extension by default)
 rusqlite = { version = "0.43", features = ["bundled"] }
@@ -34,10 +33,6 @@ tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-go = "0.25"
-
-# Local Semantic Embedding: BAAI/bge-small-en-v1.5 Quantized (~33MB ONNX, 384-dim) + CUDA Execution Provider
-fastembed = "7"
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "cuda"] }
 
 # System Config Directory Utilities
 dirs = "7.0"

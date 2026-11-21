@@ -1,15 +1,9 @@
-pub mod embedder;
 pub mod fts;
-pub mod hybrid;
 
 use crate::config::{normalize_doc_name, AppPaths, DocEntry};
 use crate::db::{init_connection, now_unix};
 use crate::indexer::index_workspace;
-use crate::memory::embedder::{
-    deserialize_f32_vec, embed_memory_passage, embed_query, is_model_cached, serialize_f32_vec,
-};
 use crate::memory::fts::{search_doc_sections_fts, search_memories_fts};
-use crate::memory::hybrid::{apply_token_budget, cosine_similarity, reciprocal_rank_fusion};
 use crate::security::to_index_path;
 use anyhow::{bail, Context, Result};
 use globset::GlobBuilder;
@@ -27,13 +21,34 @@ pub struct MemoryRecord {
     pub tags: String,
     pub content: String,
     pub md_path: Option<String>,
-    pub embedding: Option<Vec<f32>>,
     pub created_at: i64,
+}
+
+/// Selects formatted blocks within `budget_tokens` (1 token ≈ 4 bytes).
+/// Always keeps the top block intact (never slices mid-code); subsequent blocks stop once budget is met.
+fn apply_token_budget(blocks: &[String], budget_tokens: usize) -> String {
+    let max_bytes = budget_tokens.saturating_mul(4).max(240);
+    let mut out = String::new();
+
+    for block in blocks {
+        if !out.is_empty() && out.len() + block.len() > max_bytes {
+            break;
+        }
+        out.push_str(block);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if out.len() >= max_bytes {
+            break;
+        }
+    }
+
+    out
 }
 
 /// Tool 8: `remember` — appends a decision/rule, session handoff, or backlog item to Markdown
 /// (`.notes/` for `project`/`handoff`/`backlog` or `~/.config/lee/vault/` for `global`),
-/// maintains Obsidian-compatible `[[wikilinks]]` and `.notes/INDEX.md`, and indexes into SQLite FTS5 + BGE-Small.
+/// maintains Obsidian-compatible `[[wikilinks]]` and `.notes/INDEX.md`, and indexes into SQLite FTS5.
 pub fn store_memory(
     project_conn: &Connection,
     paths: &AppPaths,
@@ -96,38 +111,20 @@ pub fn store_memory(
         )?;
     }
 
-    let emb_blob = embed_memory_passage(&paths.models_dir, topic, tags_str, content)
-        .map(|v| serialize_f32_vec(&v));
     let md_path_str = md_file.to_string_lossy().to_string();
 
     if scope_norm == "global" {
         let global_conn = init_connection(&paths.global_db)?;
         global_conn.execute(
-            "INSERT INTO memories_meta (scope, topic, tags, content, md_path, embedding, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                scope_norm,
-                topic,
-                tags_str,
-                content.trim(),
-                &md_path_str,
-                emb_blob,
-                ts
-            ],
+            "INSERT INTO memories_meta (scope, topic, tags, content, md_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![scope_norm, topic, tags_str, content.trim(), &md_path_str, ts],
         )?;
     } else {
         project_conn.execute(
-            "INSERT INTO memories_meta (scope, topic, tags, content, md_path, embedding, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                scope_norm,
-                topic,
-                tags_str,
-                content.trim(),
-                &md_path_str,
-                emb_blob,
-                ts
-            ],
+            "INSERT INTO memories_meta (scope, topic, tags, content, md_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![scope_norm, topic, tags_str, content.trim(), &md_path_str, ts],
         )?;
         let _ = update_generated_notes_index(project_conn, &paths.notes_dir);
     }
@@ -197,33 +194,6 @@ pub fn update_generated_notes_index(conn: &Connection, notes_dir: &Path) -> Resu
     Ok(())
 }
 
-/// Backfills any `memories_meta` rows where `embedding IS NULL` when `BGESmallENV15Q` is available.
-pub fn backfill_missing_memory_embeddings(conn: &Connection, models_dir: &Path) -> Result<usize> {
-    if !is_model_cached(models_dir) {
-        return Ok(0);
-    }
-    let mut stmt = conn.prepare(
-        "SELECT id, topic, tags, content FROM memories_meta WHERE embedding IS NULL",
-    )?;
-    let missing: Vec<(i64, String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let mut updated = 0usize;
-    for (id, topic, tags, content) in missing {
-        if let Some(vec) = embed_memory_passage(models_dir, &topic, &tags, &content) {
-            let blob = serialize_f32_vec(&vec);
-            conn.execute(
-                "UPDATE memories_meta SET embedding = ?1 WHERE id = ?2",
-                params![blob, id],
-            )?;
-            updated += 1;
-        }
-    }
-    Ok(updated)
-}
-
 /// Parses YAML frontmatter (`topic`, `tags`, `scope`, `created_at`) and strips the leading `# Title`
 /// from a `.notes/*.md` file so synced notes stay clean without raw frontmatter noise.
 fn parse_note_markdown(raw: &str, default_topic: &str, default_scope: &str) -> (String, String, String, i64, String) {
@@ -270,12 +240,7 @@ fn parse_note_markdown(raw: &str, default_topic: &str, default_scope: &str) -> (
 /// Syncs `.md` files in `.notes/` or `vault/` (excluding `INDEX.md`) with `memories_meta`,
 /// pruning any DB rows whose backing `.md` file was deleted or rolled back, and healing any
 /// legacy unparsed frontmatter rows.
-fn sync_notes_dir_to_db(
-    conn: &Connection,
-    dir: &Path,
-    scope: &str,
-    models_dir: &Path,
-) -> Result<()> {
+fn sync_notes_dir_to_db(conn: &Connection, dir: &Path, scope: &str) -> Result<()> {
     // 1. Prune stale DB entries whose backing .md file no longer exists on disk, or heal raw frontmatter rows
     if let Ok(mut stmt) = conn.prepare("SELECT id, md_path, content FROM memories_meta WHERE md_path IS NOT NULL") {
         let existing_rows: Vec<(i64, String, String)> = stmt
@@ -332,15 +297,12 @@ fn sync_notes_dir_to_db(
             .replace('-', " ");
         let (topic, tags, parsed_scope, created_at, clean_body) =
             parse_note_markdown(&raw, &default_topic, scope);
-        let emb_blob = embed_memory_passage(models_dir, &topic, &tags, &clean_body)
-            .map(|v| serialize_f32_vec(&v));
         conn.execute(
-            "INSERT INTO memories_meta (scope, topic, tags, content, md_path, embedding, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![parsed_scope, topic, tags, clean_body, path_str, emb_blob, created_at],
+            "INSERT INTO memories_meta (scope, topic, tags, content, md_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![parsed_scope, topic, tags, clean_body, path_str, created_at],
         )?;
     }
-    let _ = backfill_missing_memory_embeddings(conn, models_dir);
     Ok(())
 }
 
@@ -364,20 +326,17 @@ pub fn extract_wikilinks(text: &str) -> Vec<String> {
     links
 }
 
-/// Tool 9: `recall_memory` — hybrid search across Project `.notes/` (including `handoff` & `backlog`)
+/// Tool 9: `recall_memory` — FTS5 BM25 search across Project `.notes/` (including `handoff` & `backlog`)
 /// and Global `vault/`, with 1-hop Obsidian `[[wikilinks]]` expansion.
-pub fn recall_memories_hybrid(
+pub fn recall_memories(
     project_conn: &Connection,
     paths: &AppPaths,
     query: &str,
     budget_tokens: usize,
 ) -> Result<(String, usize)> {
-    let _ = sync_notes_dir_to_db(project_conn, &paths.notes_dir, "project", &paths.models_dir);
+    let _ = sync_notes_dir_to_db(project_conn, &paths.notes_dir, "project");
 
-    let query_vec = embed_query(&paths.models_dir, query);
-
-    let mut fts_keys: Vec<(String, i64)> = Vec::new();
-    let mut vec_scored: Vec<((String, i64), f32)> = Vec::new();
+    let mut matched_keys: Vec<(String, i64)> = Vec::new();
     let mut records_map: HashMap<(String, i64), MemoryRecord> = HashMap::new();
     let mut total_raw_bytes = 0usize;
 
@@ -386,9 +345,7 @@ pub fn recall_memories_hybrid(
         project_conn,
         "project",
         query,
-        query_vec.as_deref(),
-        &mut fts_keys,
-        &mut vec_scored,
+        &mut matched_keys,
         &mut records_map,
         &mut total_raw_bytes,
     )?;
@@ -397,24 +354,19 @@ pub fn recall_memories_hybrid(
     if paths.global_db.exists() || paths.vault_dir.exists() {
         let _ = paths.ensure_global_dirs();
         if let Ok(global_conn) = init_connection(&paths.global_db) {
-            let _ =
-                sync_notes_dir_to_db(&global_conn, &paths.vault_dir, "global", &paths.models_dir);
+            let _ = sync_notes_dir_to_db(&global_conn, &paths.vault_dir, "global");
             let _ = collect_db_memories(
                 &global_conn,
                 "global",
                 query,
-                query_vec.as_deref(),
-                &mut fts_keys,
-                &mut vec_scored,
+                &mut matched_keys,
                 &mut records_map,
                 &mut total_raw_bytes,
             );
         }
     }
 
-    let fused = reciprocal_rank_fusion(&fts_keys, vec_scored);
-
-    if fused.is_empty() {
+    if matched_keys.is_empty() {
         let msg = format!("No relevant project or global memories found for query: '{query}'.\n");
         return Ok((msg.clone(), total_raw_bytes.max(msg.len())));
     }
@@ -422,12 +374,15 @@ pub fn recall_memories_hybrid(
     let mut formatted_blocks = Vec::new();
     let mut included_keys: HashSet<(String, i64)> = HashSet::new();
 
-    for (key, score) in &fused {
+    for key in &matched_keys {
+        if included_keys.contains(key) {
+            continue;
+        }
         if let Some(rec) = records_map.get(key) {
             included_keys.insert(key.clone());
             let slug = slugify(&rec.topic);
             let block = format!(
-                "- **[{scope}] [[{slug}|{topic}]]** (tags: `{tags}`, rrf: `{score:.4}`)\n  {content}\n",
+                "- **[{scope}] [[{slug}|{topic}]]** (tags: `{tags}`)\n  {content}\n",
                 scope = rec.scope,
                 topic = rec.topic,
                 tags = rec.tags,
@@ -523,14 +478,11 @@ pub fn list_backlog_and_handoff(conn: &Connection) -> Result<String> {
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn collect_db_memories(
     conn: &Connection,
     scope_prefix: &str,
     query: &str,
-    query_vec: Option<&[f32]>,
     fts_keys: &mut Vec<(String, i64)>,
-    vec_scored: &mut Vec<((String, i64), f32)>,
     records_map: &mut HashMap<(String, i64), MemoryRecord>,
     total_raw_bytes: &mut usize,
 ) -> Result<()> {
@@ -541,11 +493,10 @@ fn collect_db_memories(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT id, scope, topic, tags, content, md_path, embedding, created_at
+        "SELECT id, scope, topic, tags, content, md_path, created_at
          FROM memories_meta",
     )?;
     let rows = stmt.query_map([], |r| {
-        let emb_bytes: Option<Vec<u8>> = r.get(6)?;
         Ok(MemoryRecord {
             id: r.get(0)?,
             scope: r.get(1)?,
@@ -553,8 +504,7 @@ fn collect_db_memories(
             tags: r.get(3)?,
             content: r.get(4)?,
             md_path: r.get(5)?,
-            embedding: emb_bytes.map(|b| deserialize_f32_vec(&b)),
-            created_at: r.get(7)?,
+            created_at: r.get(6)?,
         })
     })?;
 
@@ -562,11 +512,6 @@ fn collect_db_memories(
     for row in rows.flatten() {
         *total_raw_bytes += row.content.len() + row.topic.len();
         let key = (scope_prefix.to_string(), row.id);
-
-        if let (Some(qv), Some(ev)) = (query_vec, row.embedding.as_deref()) {
-            let sim = cosine_similarity(qv, ev);
-            vec_scored.push((key.clone(), sim));
-        }
 
         // Substring fallback if FTS5 tokenizer missed exact symbol/punctuation or scope match
         if !fts_keys.contains(&key)
@@ -592,7 +537,6 @@ struct DocSectionRecord {
     start_line: i64,
     end_line: i64,
     content: String,
-    embedding: Option<Vec<f32>>,
 }
 
 fn path_matches_doc_key(file_path: &str, doc_key: &str) -> bool {
@@ -621,8 +565,8 @@ fn match_named_docs<'a>(entries: &'a [DocEntry], query_name: &str) -> Vec<&'a Do
         .collect()
 }
 
-/// Tool 4: `search_docs` — hybrid FTS5 BM25 + BGE-Small vector search across `.md` sections in workspace & global docs.
-pub fn search_docs_hybrid(
+/// Tool 4: `search_docs` — SQLite FTS5 BM25 search across `.md`/`.mdx` sections in workspace & global docs.
+pub fn search_docs(
     conn: &mut Connection,
     paths: &AppPaths,
     query: &str,
@@ -738,14 +682,12 @@ pub fn search_docs_hybrid(
     };
 
     let fts_raw = search_doc_sections_fts(conn, query, 50).unwrap_or_default();
-    let query_vec = embed_query(&paths.models_dir, query);
 
     let mut stmt = conn.prepare(
-        "SELECT id, file_path, heading, start_line, end_line, content, embedding
+        "SELECT id, file_path, heading, start_line, end_line, content
          FROM doc_sections_meta",
     )?;
     let rows = stmt.query_map([], |r| {
-        let emb_blob: Option<Vec<u8>> = r.get(6)?;
         Ok(DocSectionRecord {
             id: r.get(0)?,
             file_path: r.get(1)?,
@@ -753,12 +695,10 @@ pub fn search_docs_hybrid(
             start_line: r.get(3)?,
             end_line: r.get(4)?,
             content: r.get(5)?,
-            embedding: emb_blob.map(|b| deserialize_f32_vec(&b)),
         })
     })?;
 
     let mut sections_map: HashMap<i64, DocSectionRecord> = HashMap::new();
-    let mut vec_scored: Vec<(i64, f32)> = Vec::new();
     let mut fts_filtered: Vec<i64> = Vec::new();
     let fts_set: HashSet<i64> = fts_raw.iter().copied().collect();
     let q_lower = query.to_lowercase();
@@ -766,10 +706,6 @@ pub fn search_docs_hybrid(
     for sec in rows.flatten() {
         if !matches_file(&sec.file_path) {
             continue;
-        }
-        if let (Some(qv), Some(ev)) = (query_vec.as_deref(), sec.embedding.as_deref()) {
-            let sim = cosine_similarity(qv, ev);
-            vec_scored.push((sec.id, sim));
         }
         if !fts_set.contains(&sec.id)
             && (sec.heading.to_lowercase().contains(&q_lower)
@@ -792,8 +728,7 @@ pub fn search_docs_hybrid(
         }
     }
 
-    let fused = reciprocal_rank_fusion(&ordered_fts, vec_scored);
-    if fused.is_empty() {
+    if ordered_fts.is_empty() {
         let msg = format!("No documentation sections matched query '{query}'.\n");
         return Ok((msg.clone(), msg.len()));
     }
@@ -802,7 +737,7 @@ pub fn search_docs_hybrid(
     let mut blocks = Vec::new();
     let mut seen_ranges: Vec<(String, i64, i64)> = Vec::new();
 
-    for (sec_id, score) in fused {
+    for sec_id in ordered_fts {
         if let Some(sec) = sections_map.get(&sec_id) {
             // Skip overlapping windows from the same file if already covered
             if seen_ranges.iter().any(|(fp, st, en)| {
@@ -813,7 +748,7 @@ pub fn search_docs_hybrid(
             seen_ranges.push((sec.file_path.clone(), sec.start_line, sec.end_line));
             matched_files.insert(sec.file_path.clone());
             let block = format!(
-                "### {} [{start}..{end}] — `{heading}` (rrf: `{score:.4}`)\n{content}\n\n",
+                "### {} [{start}..{end}] — `{heading}`\n{content}\n\n",
                 sec.file_path,
                 start = sec.start_line,
                 end = sec.end_line,
@@ -875,7 +810,6 @@ mod tests {
         let mut paths = AppPaths::from_root(temp.clone()).unwrap();
         paths.global_dir = temp.join("global_cfg");
         paths.global_db = paths.global_dir.join("global.db");
-        paths.models_dir = paths.global_dir.join("models");
         paths.vault_dir = paths.global_dir.join("vault");
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
@@ -924,7 +858,7 @@ mod tests {
 
         // Verify 1-hop [[wikilink]] expansion: querying Indexer Transaction Rule pulls in Database WAL Mode
         let (recalled, _) =
-            recall_memories_hybrid(&conn, &paths, "Indexer Transaction Rule", 600).unwrap();
+            recall_memories(&conn, &paths, "Indexer Transaction Rule", 600).unwrap();
         assert!(recalled.contains("Indexer Transaction Rule"));
         assert!(recalled.contains("Database WAL Mode"));
 

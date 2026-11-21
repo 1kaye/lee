@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
 
--- 3. Documentation Section Metadata & Vector Embeddings (.md Sections)
+-- 3. Documentation Section Metadata (.md / .mdx Sections)
 CREATE TABLE IF NOT EXISTS doc_sections_meta (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_path TEXT NOT NULL,
@@ -30,7 +30,6 @@ CREATE TABLE IF NOT EXISTS doc_sections_meta (
     start_line INTEGER NOT NULL,
     end_line INTEGER NOT NULL,
     content TEXT NOT NULL,       -- Section body text and code snippets
-    embedding BLOB,              -- BGE-Small [f32; 384] array in little-endian bytes (1,536 bytes)
     FOREIGN KEY (file_path) REFERENCES file_hashes(file_path) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_doc_sections_file ON doc_sections_meta(file_path);
@@ -68,7 +67,7 @@ CREATE TABLE IF NOT EXISTS handles (
     created_at INTEGER NOT NULL
 );
 
--- 6. Memory Metadata & BGE-Small Vector Embeddings (384-dim)
+-- 6. Memory Metadata
 CREATE TABLE IF NOT EXISTS memories_meta (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     scope TEXT NOT NULL,         -- 'project', 'global', 'handoff', or 'backlog'
@@ -76,7 +75,6 @@ CREATE TABLE IF NOT EXISTS memories_meta (
     tags TEXT NOT NULL,
     content TEXT NOT NULL,
     md_path TEXT,                -- Path to backing Markdown file on disk
-    embedding BLOB,              -- [f32; 384] array in little-endian bytes (1,536 bytes)
     created_at INTEGER NOT NULL
 );
 

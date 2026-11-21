@@ -2,15 +2,11 @@ pub mod languages;
 pub mod markdown;
 pub mod parser;
 
-use crate::config::AppPaths;
+use crate::config::{AppPaths, DocEntry, DocScope};
 use crate::db::now_unix;
 use crate::indexer::languages::CodeLanguage;
-use crate::indexer::markdown::ExtractedSymbol;
+use crate::indexer::markdown::{DocSectionChunk, ExtractedSymbol};
 use crate::indexer::parser::{is_non_doc_comment_line, parse_file_content, ConfigFormat, IndexedFileType};
-use crate::memory::embedder::{
-    cap_passage_chars, embed_doc_section_passage, is_model_cached, serialize_f32_vec,
-    try_embed_batch, MAX_PASSAGE_CHARS,
-};
 use crate::security::{is_denied_path, to_index_path, validate_path};
 use anyhow::{bail, Context, Result};
 use globset::GlobBuilder;
@@ -39,7 +35,20 @@ pub struct IndexStats {
 fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | ".kaye" | ".lee" | ".notes" | "target" | "node_modules" | "dist" | "build"
+        ".git"
+            | ".kaye"
+            | ".lee"
+            | ".notes"
+            | "target"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".astro"
+            | ".docusaurus"
+            | ".svelte-kit"
+            | ".cache"
+            | ".output"
     )
 }
 
@@ -112,6 +121,46 @@ pub fn purge_source_from_db(conn: &Connection, source_path: &Path) -> Result<usi
     Ok(deleted)
 }
 
+fn expected_hash_suffix(ft: Option<IndexedFileType>, is_doc_source: bool) -> &'static str {
+    match ft {
+        Some(IndexedFileType::Markdown) => ":md3",
+        Some(f) if f.is_code() => {
+            if is_doc_source {
+                ":d1"
+            } else {
+                ":r1"
+            }
+        }
+        _ => "",
+    }
+}
+
+fn is_under_doc_paths(file_path: &Path, doc_paths: &[PathBuf]) -> bool {
+    doc_paths
+        .iter()
+        .any(|root| file_path == root || file_path.starts_with(root))
+}
+
+fn attach_full_code_doc_section(
+    file_path: &Path,
+    raw_content: &str,
+    parsed: &mut parser::ParsedFileResult,
+) {
+    if parsed.file_type.is_code() && !raw_content.trim().is_empty() {
+        let heading = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("code")
+            .to_string();
+        parsed.doc_sections.push(DocSectionChunk {
+            heading,
+            start_line: 1,
+            end_line: parsed.line_count,
+            content: raw_content.to_string(),
+        });
+    }
+}
+
 /// Scans and lazily indexes all supported code and Markdown files in `subpath` + `sources`.
 pub fn index_workspace(
     conn: &mut Connection,
@@ -167,11 +216,9 @@ pub fn index_workspace(
         let index_key = to_index_path(&paths.project_root, file_path);
         seen_keys.insert(index_key.clone());
 
-        let expected_suffix = match IndexedFileType::classify(file_path) {
-            Some(IndexedFileType::Markdown) => ":md2",
-            Some(IndexedFileType::Code(_)) => ":r1",
-            _ => "",
-        };
+        let is_doc_source = is_under_doc_paths(file_path, &all_docs);
+        let expected_suffix =
+            expected_hash_suffix(IndexedFileType::classify(file_path), is_doc_source);
 
         // Fast-path: if file mtime is strictly older than last_indexed (at least 1s earlier)
         // and the stored hash already carries the current schema suffix, skip disk read + blake3
@@ -206,7 +253,10 @@ pub fn index_workspace(
             continue;
         }
 
-        if let Some(parsed) = parse_file_content(file_path, &raw_content)? {
+        if let Some(mut parsed) = parse_file_content(file_path, &raw_content)? {
+            if is_doc_source {
+                attach_full_code_doc_section(file_path, &raw_content, &mut parsed);
+            }
             stats.files_reindexed += 1;
             upsert_parsed_file(&tx, &index_key, &new_hash, &parsed)?;
         }
@@ -223,10 +273,6 @@ pub fn index_workspace(
     }
 
     tx.commit()?;
-
-    if is_model_cached(&paths.models_dir) {
-        let _ = backfill_missing_doc_embeddings(conn, &paths.models_dir);
-    }
 
     // Populate total counts from DB
     stats.code_symbols = conn
@@ -258,65 +304,152 @@ pub fn index_workspace(
     Ok(stats)
 }
 
-/// Computes BGE embeddings for all `doc_sections_meta` rows where `embedding IS NULL`.
-/// Uses length-sorted batching (`batch_size = 32`, `max_length = 128`) and CUDA->CPU ExecutionProvider
-/// to eliminate padding overhead and maximize throughput.
-pub fn backfill_missing_doc_embeddings(conn: &mut Connection, models_dir: &Path) -> Result<usize> {
-    if !is_model_cached(models_dir) {
-        return Ok(0);
+#[derive(Debug, Clone)]
+pub struct DocUpdateReport {
+    pub scope: DocScope,
+    pub name: String,
+    pub path: PathBuf,
+    pub missing: bool,
+    pub files_scanned: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+}
+
+impl DocUpdateReport {
+    pub fn has_changes(&self) -> bool {
+        self.added > 0 || self.updated > 0 || self.removed > 0
     }
-    let mut missing: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, file_path, heading, content FROM doc_sections_meta WHERE embedding IS NULL",
-        )?;
+}
+
+fn path_belongs_to_doc(file_path: &str, doc_key: &str) -> bool {
+    let key = doc_key.trim_end_matches('/');
+    file_path == key || file_path.starts_with(&format!("{key}/"))
+}
+
+/// Incrementally updates registered workspace & global docs in SQLite.
+/// Docs with no added, modified, or removed files are skipped without writing to the DB.
+pub fn update_registered_docs(
+    conn: &mut Connection,
+    paths: &AppPaths,
+    docs: &[(DocScope, DocEntry)],
+) -> Result<Vec<DocUpdateReport>> {
+    let existing_db_map: HashMap<String, (String, i64)> = {
+        let mut stmt = conn.prepare("SELECT file_path, blake3_hash, last_indexed FROM file_hashes")?;
         let rows = stmt
             .query_map([], |r| {
-                let id: i64 = r.get(0)?;
-                let fp: String = r.get(1)?;
-                let heading: String = r.get(2)?;
-                let content: String = r.get(3)?;
-                let snippet = cap_passage_chars(&content, MAX_PASSAGE_CHARS);
-                let passage = format!("passage: {fp} > {heading} - {snippet}");
-                Ok((id, passage))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, String>(1)?, r.get::<_, i64>(2)?),
+                ))
             })?
             .filter_map(|r| r.ok())
             .collect();
         rows
     };
 
-    if missing.is_empty() {
-        return Ok(0);
-    }
+    let mut reports = Vec::with_capacity(docs.len());
 
-    // Sort by byte length so every batch of 32 has near-identical token length (zero padding waste)
-    missing.sort_by_key(|(_, text)| text.len());
+    for (scope, entry) in docs {
+        if !entry.path.exists() {
+            reports.push(DocUpdateReport {
+                scope: *scope,
+                name: entry.name.clone(),
+                path: entry.path.clone(),
+                missing: true,
+                files_scanned: 0,
+                added: 0,
+                updated: 0,
+                removed: 0,
+                unchanged: 0,
+            });
+            continue;
+        }
 
-    let mut updated = 0usize;
-    for super_chunk in missing.chunks(256) {
-        let mut computed_pairs: Vec<(i64, Vec<u8>)> = Vec::with_capacity(super_chunk.len());
-        for batch in super_chunk.chunks(32) {
-            let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-            let Some(vecs) = try_embed_batch(models_dir, texts) else {
-                break;
+        let doc_key = to_index_path(&paths.project_root, &entry.path);
+        let files = collect_workspace_files(&entry.path, &[]);
+        let mut seen_keys: HashSet<String> = HashSet::with_capacity(files.len());
+        let mut to_upsert: Vec<(String, String, parser::ParsedFileResult)> = Vec::new();
+        let mut added = 0usize;
+        let mut updated = 0usize;
+        let mut unchanged = 0usize;
+
+        for file_path in &files {
+            let index_key = to_index_path(&paths.project_root, file_path);
+            seen_keys.insert(index_key.clone());
+
+            let expected_suffix = expected_hash_suffix(IndexedFileType::classify(file_path), true);
+
+            if let Some((old_hash, last_idx)) = existing_db_map.get(&index_key)
+                && (expected_suffix.is_empty() || old_hash.ends_with(expected_suffix))
+                && let Ok(meta) = fs::metadata(file_path)
+                && let Ok(mtime) = meta.modified()
+                && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
+                && (dur.as_secs() as i64) < *last_idx
+            {
+                unchanged += 1;
+                continue;
+            }
+
+            let Ok(raw_content) = fs::read_to_string(file_path) else {
+                continue;
             };
-            for ((id, _), vec) in batch.iter().zip(vecs.into_iter()) {
-                computed_pairs.push((*id, serialize_f32_vec(&vec)));
+            let raw_hash = blake3::hash(raw_content.as_bytes()).to_hex().to_string();
+            let new_hash = format!("{raw_hash}{expected_suffix}");
+
+            match existing_db_map.get(&index_key).map(|(h, _)| h.as_str()) {
+                Some(h) if h == new_hash.as_str() => {
+                    unchanged += 1;
+                }
+                existing => {
+                    if let Some(mut parsed) = parse_file_content(file_path, &raw_content)? {
+                        attach_full_code_doc_section(file_path, &raw_content, &mut parsed);
+                        if existing.is_some() {
+                            updated += 1;
+                        } else {
+                            added += 1;
+                        }
+                        to_upsert.push((index_key, new_hash, parsed));
+                    }
+                }
             }
         }
-        if computed_pairs.is_empty() {
-            break;
+
+        let to_remove: Vec<&String> = existing_db_map
+            .keys()
+            .filter(|db_path| path_belongs_to_doc(db_path, &doc_key) && !seen_keys.contains(*db_path))
+            .collect();
+        let removed = to_remove.len();
+
+        if !to_upsert.is_empty() || !to_remove.is_empty() {
+            let tx = conn.transaction()?;
+            for (index_key, new_hash, parsed) in &to_upsert {
+                upsert_parsed_file(&tx, index_key, new_hash, parsed)?;
+            }
+            if !to_remove.is_empty() {
+                let mut del_stmt = tx.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?;
+                for db_path in &to_remove {
+                    del_stmt.execute(params![db_path])?;
+                }
+            }
+            tx.commit()?;
         }
-        let tx = conn.transaction()?;
-        for (id, blob) in computed_pairs {
-            tx.execute(
-                "UPDATE doc_sections_meta SET embedding = ?1 WHERE id = ?2",
-                params![blob, id],
-            )?;
-            updated += 1;
-        }
-        tx.commit()?;
+
+        reports.push(DocUpdateReport {
+            scope: *scope,
+            name: entry.name.clone(),
+            path: entry.path.clone(),
+            missing: false,
+            files_scanned: files.len(),
+            added,
+            updated,
+            removed,
+            unchanged,
+        });
     }
-    Ok(updated)
+
+    Ok(reports)
 }
 
 fn upsert_parsed_file(
@@ -376,8 +509,8 @@ fn upsert_parsed_file(
 
     {
         let mut sec_stmt = conn.prepare_cached(
-            "INSERT INTO doc_sections_meta (file_path, heading, start_line, end_line, content, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            "INSERT INTO doc_sections_meta (file_path, heading, start_line, end_line, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
         for sec in &parsed.doc_sections {
             sec_stmt.execute(params![
@@ -420,12 +553,10 @@ pub fn ensure_single_file_indexed(
         .with_context(|| format!("Failed to read file '{}'", resolved.display()))?;
     let raw_bytes = raw_content.len();
     let index_key = to_index_path(&paths.project_root, &resolved);
+    let is_doc_source = is_under_doc_paths(&resolved, &paths.all_doc_paths());
     let raw_hash = blake3::hash(raw_content.as_bytes()).to_hex().to_string();
-    let new_hash = match IndexedFileType::classify(&resolved) {
-        Some(IndexedFileType::Markdown) => format!("{raw_hash}:md2"),
-        Some(IndexedFileType::Code(_)) => format!("{raw_hash}:r1"),
-        _ => raw_hash,
-    };
+    let expected_suffix = expected_hash_suffix(IndexedFileType::classify(&resolved), is_doc_source);
+    let new_hash = format!("{raw_hash}{expected_suffix}");
 
     let existing_hash: Option<String> = conn
         .query_row(
@@ -436,24 +567,11 @@ pub fn ensure_single_file_indexed(
         .optional()?;
 
     if existing_hash.as_deref() != Some(new_hash.as_str()) {
-        if let Some(parsed) = parse_file_content(&resolved, &raw_content)? {
-            upsert_parsed_file(conn, &index_key, &new_hash, &parsed)?;
-            if parsed.file_type == IndexedFileType::Markdown && is_model_cached(&paths.models_dir) {
-                for sec in &parsed.doc_sections {
-                    if let Some(vec) = embed_doc_section_passage(
-                        &paths.models_dir,
-                        &index_key,
-                        &sec.heading,
-                        &sec.content,
-                    ) {
-                        let blob = serialize_f32_vec(&vec);
-                        let _ = conn.execute(
-                            "UPDATE doc_sections_meta SET embedding = ?1 WHERE file_path = ?2 AND start_line = ?3",
-                            params![blob, &index_key, sec.start_line as i64],
-                        );
-                    }
-                }
+        if let Some(mut parsed) = parse_file_content(&resolved, &raw_content)? {
+            if is_doc_source {
+                attach_full_code_doc_section(&resolved, &raw_content, &mut parsed);
             }
+            upsert_parsed_file(conn, &index_key, &new_hash, &parsed)?;
         }
     }
 
@@ -1517,5 +1635,144 @@ pub fn find_symbol_references(
     }
 
     Ok((out.clone(), raw_bytes.max(out.len())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_connection;
+
+    #[test]
+    fn test_update_registered_docs_incremental() {
+        let temp = std::env::temp_dir().join(format!("lee_docs_upd_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let ws_doc = temp.join("ws_doc");
+        let gl_doc = temp.join("gl_doc");
+        fs::create_dir_all(&ws_doc).unwrap();
+        fs::create_dir_all(&gl_doc).unwrap();
+
+        fs::write(ws_doc.join("a.mdx"), "# Alpha\nInitial alpha content.\n").unwrap();
+        fs::write(ws_doc.join("old.mdx"), "# Old\nTo be deleted.\n").unwrap();
+        fs::write(gl_doc.join("g.mdx"), "# Global\nStable global doc.\n").unwrap();
+
+        let mut paths = AppPaths::from_root(temp.clone()).unwrap();
+        paths.global_dir = temp.join("global_cfg");
+        paths.global_db = paths.global_dir.join("global.db");
+        paths.global_config_file = paths.global_dir.join("config.json");
+        paths.vault_dir = paths.global_dir.join("vault");
+        paths.ensure_local_dirs().unwrap();
+        paths.ensure_global_dirs().unwrap();
+
+        let ws_entry = paths.add_doc(DocScope::Workspace, &ws_doc, "ws docs").unwrap();
+        let gl_entry = paths.add_doc(DocScope::Global, &gl_doc, "gl docs").unwrap();
+        let docs = vec![
+            (DocScope::Workspace, ws_entry),
+            (DocScope::Global, gl_entry),
+        ];
+
+        let mut conn = init_connection(&paths.local_db).unwrap();
+
+        // First sync: both docs add their initial files
+        let first = update_registered_docs(&mut conn, &paths, &docs).unwrap();
+        assert_eq!(first[0].added, 2);
+        assert_eq!(first[1].added, 1);
+
+        // Second sync with no changes: both docs skipped
+        let second = update_registered_docs(&mut conn, &paths, &docs).unwrap();
+        assert!(!second[0].has_changes());
+        assert!(!second[1].has_changes());
+
+        // Modify a.mdx, add b.mdx, remove old.mdx in ws_doc only; leave gl_doc untouched
+        fs::write(ws_doc.join("a.mdx"), "# Alpha\nUpdated alpha content v2.\n").unwrap();
+        fs::write(ws_doc.join("b.mdx"), "# Beta\nBrand new file.\n").unwrap();
+        fs::remove_file(ws_doc.join("old.mdx")).unwrap();
+
+        let third = update_registered_docs(&mut conn, &paths, &docs).unwrap();
+        assert_eq!(third[0].added, 1);
+        assert_eq!(third[0].updated, 1);
+        assert_eq!(third[0].removed, 1);
+        assert!(!third[1].has_changes());
+
+        let old_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM doc_sections_meta WHERE file_path LIKE '%old.mdx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 0);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_registered_doc_code_files_multilang_indexed_full() {
+        let temp = std::env::temp_dir().join(format!("lee_doc_code_full_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let docs_dir = temp.join("ext_docs");
+        fs::create_dir_all(&docs_dir).unwrap();
+
+        let mut big_rs = String::from("// Long Rust doc example\npub fn compute_widget() -> usize {\n");
+        for i in 1..=160 {
+            big_rs.push_str(&format!("    let step_{i} = {i};\n"));
+        }
+        big_rs.push_str("    step_160\n}\n");
+        let py_code = "def greet_user(name: str) -> str:\n    return f'hello {name}'\n";
+        let cpp_code = "int calc_sum(int a, int b) {\n    return a + b;\n}\n";
+
+        fs::write(docs_dir.join("widget.rs"), &big_rs).unwrap();
+        fs::write(docs_dir.join("helper.py"), py_code).unwrap();
+        fs::write(docs_dir.join("math.cpp"), cpp_code).unwrap();
+
+        let mut paths = AppPaths::from_root(temp.clone()).unwrap();
+        paths.global_dir = temp.join("global_cfg");
+        paths.global_db = paths.global_dir.join("global.db");
+        paths.global_config_file = paths.global_dir.join("config.json");
+        paths.vault_dir = paths.global_dir.join("vault");
+        paths.ensure_local_dirs().unwrap();
+        paths.ensure_global_dirs().unwrap();
+        paths.add_doc(DocScope::Workspace, &docs_dir, "sdk").unwrap();
+
+        let mut conn = init_connection(&paths.local_db).unwrap();
+        let (rs_out, _) = crate::memory::search_docs(
+            &mut conn,
+            &paths,
+            "compute_widget",
+            None,
+            Some("sdk"),
+            Some("workspace"),
+            400, // smaller than big_rs, yet top match must stay 100% intact
+        )
+        .unwrap();
+        assert!(rs_out.contains("let step_1 = 1;"));
+        assert!(rs_out.contains("step_160\n}"));
+        assert!(!rs_out.contains("truncated to token budget"));
+
+        let (py_out, _) = crate::memory::search_docs(
+            &mut conn,
+            &paths,
+            "greet_user",
+            None,
+            Some("sdk"),
+            Some("workspace"),
+            800,
+        )
+        .unwrap();
+        assert!(py_out.contains("def greet_user"));
+
+        let (cpp_out, _) = crate::memory::search_docs(
+            &mut conn,
+            &paths,
+            "calc_sum",
+            None,
+            Some("sdk"),
+            Some("workspace"),
+            800,
+        )
+        .unwrap();
+        assert!(cpp_out.contains("int calc_sum"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
 }
 

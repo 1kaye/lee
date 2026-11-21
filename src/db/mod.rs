@@ -17,8 +17,7 @@ pub fn init_connection(db_path: &Path) -> Result<Connection> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
-         PRAGMA foreign_keys = ON;
-         DROP TABLE IF EXISTS embedding_cache;",
+         PRAGMA foreign_keys = ON;",
     )?;
 
     conn.execute_batch(SCHEMA_SQL)

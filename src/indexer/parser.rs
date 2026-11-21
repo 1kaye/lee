@@ -15,18 +15,25 @@ pub enum ConfigFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexedFileType {
     Code(CodeLanguage),
+    PlainCode,
     Markdown,
     Config(ConfigFormat),
 }
 
 impl IndexedFileType {
     pub fn classify(path: &Path) -> Option<Self> {
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if matches!(fname, "package-lock.json" | "Cargo.lock" | "pnpm-lock.yaml" | "yarn.lock")
+            || fname.ends_with(".min.js")
+            || fname.ends_with(".min.css")
+        {
+            return None;
+        }
         if let Some(lang) = CodeLanguage::from_path(path) {
             return Some(Self::Code(lang));
         }
-        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if matches!(fname, "package-lock.json" | "Cargo.lock" | "pnpm-lock.yaml" | "yarn.lock") {
-            return None;
+        if matches!(fname, "Dockerfile" | "Makefile") {
+            return Some(Self::PlainCode);
         }
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         if matches!(ext.as_str(), "md" | "mdx" | "markdown") {
@@ -36,13 +43,22 @@ impl IndexedFileType {
             "toml" => Some(Self::Config(ConfigFormat::Toml)),
             "yml" | "yaml" => Some(Self::Config(ConfigFormat::Yaml)),
             "json" => Some(Self::Config(ConfigFormat::Json)),
+            "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "java" | "kt" | "kts" | "swift" | "cs"
+            | "rb" | "php" | "zig" | "lua" | "sh" | "bash" | "zsh" | "fish" | "sql" | "html"
+            | "htm" | "css" | "scss" | "sass" | "less" | "vue" | "astro" | "dart" | "ex"
+            | "exs" | "scala" | "clj" | "hs" | "ml" | "r" | "nix" | "proto" | "graphql"
+            | "gql" | "prisma" | "tf" | "hcl" | "dockerfile" => Some(Self::PlainCode),
             _ => None,
         }
     }
 
+    pub fn is_code(self) -> bool {
+        matches!(self, Self::Code(_) | Self::PlainCode)
+    }
+
     pub fn as_db_str(self) -> &'static str {
         match self {
-            Self::Code(_) => "code",
+            Self::Code(_) | Self::PlainCode => "code",
             Self::Markdown => "markdown",
             Self::Config(_) => "config",
         }
@@ -75,6 +91,13 @@ pub fn parse_file_content(path: &Path, source: &str) -> Result<Option<ParsedFile
                 doc_sections: Vec::new(),
             }))
         }
+        IndexedFileType::PlainCode => Ok(Some(ParsedFileResult {
+            file_type: ft,
+            line_count,
+            symbols: Vec::new(),
+            symbol_refs: Vec::new(),
+            doc_sections: Vec::new(),
+        })),
         IndexedFileType::Markdown => {
             let parsed = parse_markdown(source);
             Ok(Some(ParsedFileResult {

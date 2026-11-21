@@ -149,7 +149,6 @@ mod tests {
         paths.global_dir = temp.join("global_cfg");
         paths.global_db = paths.global_dir.join("global.db");
         paths.global_config_file = paths.global_dir.join("config.json");
-        paths.models_dir = paths.global_dir.join("models");
         paths.vault_dir = paths.global_dir.join("vault");
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
