@@ -32,6 +32,24 @@ pub struct IndexStats {
     pub elapsed_ms: u128,
 }
 
+/// Skip files larger than 2 MB to avoid bloating SQLite with massive generated/data dumps.
+pub const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Returns `true` if `path` is `$HOME` or a filesystem root (`/`) so `lee` never scans an entire home/system tree.
+pub fn is_unsafe_workspace_root(path: &Path) -> bool {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if canonical.parent().is_none() {
+        return true;
+    }
+    if let Some(home) = dirs::home_dir() {
+        let canon_home = fs::canonicalize(&home).unwrap_or(home);
+        if canonical == canon_home {
+            return true;
+        }
+    }
+    false
+}
+
 fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
@@ -49,7 +67,32 @@ fn should_skip_dir(name: &str) -> bool {
             | ".svelte-kit"
             | ".cache"
             | ".output"
+            | ".cargo"
+            | ".rustup"
+            | ".local"
+            | ".npm"
+            | ".nvm"
+            | ".pnpm-store"
+            | ".bun"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".tox"
+            | ".gradle"
+            | ".m2"
+            | ".gemini"
+            | ".claude"
+            | ".idea"
+            | ".vscode"
+            | "vendor"
     )
+}
+
+fn is_within_index_size_limit(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|m| m.len() <= MAX_INDEX_FILE_BYTES)
+        .unwrap_or(false)
 }
 
 /// Discovers indexable files (code, Markdown, and config) across `scan_root` and registered external `sources` in parallel.
@@ -64,7 +107,10 @@ pub fn collect_workspace_files(scan_root: &Path, extra_sources: &[PathBuf]) -> V
 
     for root in roots {
         if root.is_file() {
-            if !is_denied_path(&root) && IndexedFileType::classify(&root).is_some() {
+            if !is_denied_path(&root)
+                && IndexedFileType::classify(&root).is_some()
+                && is_within_index_size_limit(&root)
+            {
                 found.lock().unwrap().push(root);
             }
             continue;
@@ -92,7 +138,10 @@ pub fn collect_workspace_files(scan_root: &Path, extra_sources: &[PathBuf]) -> V
                 if let Ok(entry) = res {
                     if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                         let p = entry.into_path();
-                        if !is_denied_path(&p) && IndexedFileType::classify(&p).is_some() {
+                        if !is_denied_path(&p)
+                            && IndexedFileType::classify(&p).is_some()
+                            && is_within_index_size_limit(&p)
+                        {
                             if let Ok(mut guard) = found_ref.lock() {
                                 guard.push(p);
                             }
@@ -242,7 +291,15 @@ pub fn index_workspace(
         Some(sp) if !sp.is_empty() && sp != "." => {
             validate_path(&paths.project_root, &all_docs, Path::new(sp))?
         }
-        _ => paths.project_root.clone(),
+        _ => {
+            if is_unsafe_workspace_root(&paths.project_root) {
+                bail!(
+                    "Refusing to index unsafe workspace root '{}' (HOME or filesystem root). Run `lee` inside a project directory.",
+                    paths.project_root.display()
+                );
+            }
+            paths.project_root.clone()
+        }
     };
 
     let include_sources = subpath.is_none() || subpath == Some(".");
@@ -1673,6 +1730,15 @@ pub fn smart_grep_search(
     };
 
     let allowed_docs = paths.all_doc_paths();
+    if path_filter.map(|s| s.trim().is_empty()).unwrap_or(true)
+        && is_unsafe_workspace_root(&paths.project_root)
+    {
+        bail!(
+            "Refusing to run `smart_grep` across unsafe root '{}' (HOME or filesystem root). Pass an explicit `path` or run inside a project directory.",
+            paths.project_root.display()
+        );
+    }
+
     let mut local_files = Vec::new();
     let mut ext_files = Vec::new();
 
@@ -2337,6 +2403,30 @@ mod tests {
         assert!(refs_out.contains("[in fn run_middle_stage] (call)"));
         assert!(refs_out.contains("2-hop caller impact:"));
         assert!(refs_out.contains("[in fn top_entry_handler] -> calls run_middle_stage"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_unsafe_workspace_root_and_oversized_file_guards() {
+        assert!(is_unsafe_workspace_root(Path::new("/")));
+        if let Some(home) = dirs::home_dir() {
+            assert!(is_unsafe_workspace_root(&home));
+        }
+
+        let temp = std::env::temp_dir().join(format!("lee_guard_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        assert!(!is_unsafe_workspace_root(&temp));
+
+        // Oversized file (> 2 MB) must be skipped by collect_workspace_files
+        fs::write(temp.join("small.rs"), "pub fn ok() {}\n").unwrap();
+        let huge = "a".repeat((MAX_INDEX_FILE_BYTES as usize) + 1024);
+        fs::write(temp.join("huge.json"), &huge).unwrap();
+
+        let files = collect_workspace_files(&temp, &[]);
+        assert!(files.iter().any(|p| p.ends_with("small.rs")));
+        assert!(!files.iter().any(|p| p.ends_with("huge.json")));
 
         let _ = fs::remove_dir_all(&temp);
     }

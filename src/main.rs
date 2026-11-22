@@ -15,7 +15,8 @@ use crate::hooks::{
     process_claude_hook,
 };
 use crate::indexer::{
-    index_global_docs, index_workspace, purge_source_from_db, update_registered_docs,
+    index_global_docs, index_workspace, is_unsafe_workspace_root, purge_source_from_db,
+    update_registered_docs,
 };
 use crate::mcp::run_stdio_server;
 use anyhow::Result;
@@ -175,6 +176,12 @@ fn main() -> Result<()> {
 }
 
 fn cmd_init(paths: &AppPaths, global: bool) -> Result<()> {
+    if is_unsafe_workspace_root(&paths.project_root) {
+        anyhow::bail!(
+            "Refusing to initialize lee workspace in '{}' (HOME or filesystem root). Run `lee init` inside a project directory.",
+            paths.project_root.display()
+        );
+    }
     paths.ensure_local_dirs()?;
     paths.ensure_global_dirs()?;
     paths.ensure_gitignore(&[".lee/", ".agents/plugins/lee/"])?;
@@ -256,6 +263,12 @@ fn cmd_add_docs(
 ) -> Result<()> {
     let canonical = fs::canonicalize(source_path)
         .map_err(|e| anyhow::anyhow!("Docs path does not exist: {} ({e})", source_path.display()))?;
+    if is_unsafe_workspace_root(&canonical) {
+        anyhow::bail!(
+            "Refusing to register '{}' (HOME or filesystem root) as a docs directory.",
+            canonical.display()
+        );
+    }
 
     let final_name = match name.map(str::trim).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),

@@ -17,7 +17,9 @@ pub fn init_connection(db_path: &Path) -> Result<Connection> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
-         PRAGMA foreign_keys = ON;",
+         PRAGMA foreign_keys = ON;
+         PRAGMA wal_autocheckpoint = 1000;
+         PRAGMA journal_size_limit = 67108864;",
     )?;
 
     conn.execute_batch(SCHEMA_SQL)
