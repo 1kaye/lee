@@ -120,12 +120,12 @@ pub fn run_command_digest_with_exit(
         } else {
             clean_combined.clone()
         };
-        let out = format!(
-            "# Command Output (exit={}, {} lines)\n{}",
-            code_num,
-            total_lines,
+        // Return clean output directly without wrapper headers so JSON/short outputs remain intact
+        let out = if compact_inline.is_empty() && code_num != 0 {
+            format!("(command exited with status {code_num})")
+        } else {
             compact_inline
-        );
+        };
         return Ok((out, raw_bytes.max(1), code_num));
     }
 

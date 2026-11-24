@@ -108,11 +108,6 @@ fn query_fts_ranked(
     Ok(ordered)
 }
 
-/// Queries `memories_fts(topic, tags, content)` with topic weighted 10x and tags 5x.
-pub fn search_memories_fts(conn: &Connection, query: &str, limit: usize) -> Result<Vec<i64>> {
-    query_fts_ranked(conn, "memories_fts", "10.0, 5.0, 1.0", query, limit)
-}
-
 /// Queries `doc_sections_fts(file_path, heading, content)` with heading weighted 10x and file_path 5x.
 pub fn search_doc_sections_fts(conn: &Connection, query: &str, limit: usize) -> Result<Vec<i64>> {
     query_fts_ranked(conn, "doc_sections_fts", "5.0, 10.0, 1.0", query, limit)

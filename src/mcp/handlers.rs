@@ -3,7 +3,7 @@ use crate::digest::{recall_handle, run_command_digest};
 use crate::indexer::{
     build_outline, build_project_map, find_symbol_references, read_symbol_range, smart_grep_search,
 };
-use crate::memory::{recall_memories, search_docs, store_memory};
+use crate::memory::search_docs;
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -68,8 +68,17 @@ fn execute_tool(
         "read_symbol" => {
             let file = args.get("file").and_then(|v| v.as_str());
             let symbol = args.get("symbol").and_then(|v| v.as_str());
-            if file.is_none() && symbol.is_none() {
-                bail!("Provide `file` or `symbol` (e.g. function name) to `read_symbol`");
+            let symbols: Vec<&str> = args
+                .get("symbols")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if file.is_none() && symbol.is_none() && symbols.is_empty() {
+                bail!("Provide `file`, `symbol`, or `symbols` to `read_symbol`");
             }
             let start_line = args
                 .get("start_line")
@@ -95,6 +104,34 @@ fn execute_tool(
                 .get("max_lines")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(180) as usize;
+
+            if !symbols.is_empty() {
+                let mut chunks = Vec::with_capacity(symbols.len());
+                let mut total_raw = 0usize;
+                for sym in symbols {
+                    match read_symbol_range(
+                        conn,
+                        paths,
+                        file,
+                        Some(sym),
+                        None,
+                        None,
+                        context_lines,
+                        strip_comments,
+                        signatures_only,
+                        max_lines,
+                    ) {
+                        Ok((txt, raw)) => {
+                            total_raw += raw;
+                            chunks.push(txt);
+                        }
+                        Err(e) => chunks.push(format!("# Error reading `{sym}`: {e}\n")),
+                    }
+                }
+                let joined = chunks.join("\n");
+                return Ok((joined.clone(), total_raw.max(joined.len())));
+            }
+
             read_symbol_range(
                 conn,
                 paths,
@@ -141,6 +178,10 @@ fn execute_tool(
                 .get("case_insensitive")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let whole_word = args
+                .get("whole_word")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let max_per_file = args
                 .get("max_per_file")
                 .and_then(|v| v.as_u64())
@@ -157,6 +198,7 @@ fn execute_tool(
                 path,
                 files_only,
                 case_insensitive,
+                whole_word,
                 max_per_file,
                 max_results,
             )
@@ -187,27 +229,6 @@ fn execute_tool(
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
             recall_handle(conn, key, item, failures_only, filter, start_line, end_line)
-        }
-        "remember" => {
-            let Some(topic) = args.get("topic").and_then(|v| v.as_str()) else {
-                bail!("Missing required parameter `topic`");
-            };
-            let Some(content) = args.get("content").and_then(|v| v.as_str()) else {
-                bail!("Missing required parameter `content`");
-            };
-            let tags = args.get("tags").and_then(|v| v.as_str());
-            let scope = args.get("scope").and_then(|v| v.as_str());
-            store_memory(conn, paths, topic, content, tags, scope)
-        }
-        "recall_memory" => {
-            let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
-                bail!("Missing required parameter `query`");
-            };
-            let budget_tokens = args
-                .get("budget_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(600) as usize;
-            recall_memories(conn, paths, query, budget_tokens)
         }
         other => bail!("Unknown MCP tool '{other}'"),
     }

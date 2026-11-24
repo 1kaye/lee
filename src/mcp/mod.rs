@@ -94,7 +94,7 @@ pub fn handle_jsonrpc_message(
                         "name": "lee",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": crate::AGENTS_MD_RULES
+                    "instructions": "Use lee MCP tools for AST navigation, docs search, and log digesting: project_map (PageRank overview), outline/read_symbol (supports batch `symbols` & fuzzy lookup) for large files, find_references (1-hop & 2-hop impact) before refactors, smart_grep (`whole_word`) over rg, search_docs for Markdown/registered docs, and run_digest/recall for noisy build logs."
                 }),
             ))
         }
@@ -149,7 +149,6 @@ mod tests {
         paths.global_dir = temp.join("global_cfg");
         paths.global_db = paths.global_dir.join("global.db");
         paths.global_config_file = paths.global_dir.join("config.json");
-        paths.vault_dir = paths.global_dir.join("vault");
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
 
@@ -170,7 +169,7 @@ mod tests {
             .as_array()
             .unwrap()
             .len();
-        assert_eq!(tools_arr, 10);
+        assert_eq!(tools_arr, 8);
 
         // 2. project_map
         let map_resp = handle_jsonrpc_message(
@@ -199,7 +198,7 @@ mod tests {
             .to_string();
         assert!(out_txt.contains("## Hybrid Search Architecture"));
 
-        // 4. read_symbol on .rs
+        // 4. read_symbol on .rs (single & batch `symbols`)
         let read_resp = handle_jsonrpc_message(
             &mut conn,
             &paths,
@@ -211,6 +210,19 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(read_txt.contains("pub fn start"));
+
+        let batch_resp = handle_jsonrpc_message(
+            &mut conn,
+            &paths,
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"read_symbol","arguments":{"symbols":["Engine","start"]}}}"#,
+        )
+        .unwrap();
+        let batch_txt = batch_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(batch_txt.contains("pub struct Engine"));
+        assert!(batch_txt.contains("pub fn start"));
 
         // 5. search_docs
         let docs_resp = handle_jsonrpc_message(

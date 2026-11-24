@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 pub const APP_NAME: &str = "lee";
 pub const LOCAL_DIR_NAME: &str = ".lee";
-pub const NOTES_DIR_NAME: &str = ".notes";
 pub const DB_FILE_NAME: &str = "lee.db";
 pub const GLOBAL_DB_FILE_NAME: &str = "global.db";
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -95,11 +94,9 @@ pub struct AppPaths {
     pub local_dir: PathBuf,
     pub local_db: PathBuf,
     pub config_file: PathBuf,
-    pub notes_dir: PathBuf,
     pub global_dir: PathBuf,
     pub global_db: PathBuf,
     pub global_config_file: PathBuf,
-    pub vault_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -118,7 +115,6 @@ impl AppPaths {
         let local_dir = project_root.join(LOCAL_DIR_NAME);
         let local_db = local_dir.join(DB_FILE_NAME);
         let config_file = local_dir.join(CONFIG_FILE_NAME);
-        let notes_dir = local_dir.join(NOTES_DIR_NAME);
 
         let global_dir = if let Ok(custom) = std::env::var("LEE_GLOBAL_DIR") {
             PathBuf::from(custom)
@@ -132,18 +128,15 @@ impl AppPaths {
 
         let global_db = global_dir.join(GLOBAL_DB_FILE_NAME);
         let global_config_file = global_dir.join(CONFIG_FILE_NAME);
-        let vault_dir = global_dir.join("vault");
 
         Ok(Self {
             project_root,
             local_dir,
             local_db,
             config_file,
-            notes_dir,
             global_dir,
             global_db,
             global_config_file,
-            vault_dir,
         })
     }
 
@@ -164,32 +157,6 @@ impl AppPaths {
     pub fn ensure_local_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.local_dir)
             .with_context(|| format!("Failed to create {}", self.local_dir.display()))?;
-        fs::create_dir_all(&self.notes_dir)
-            .with_context(|| format!("Failed to create {}", self.notes_dir.display()))?;
-
-        // Migrate legacy `<project_root>/.notes` into `.lee/.notes`
-        let legacy_notes = self.project_root.join(NOTES_DIR_NAME);
-        if legacy_notes.is_dir() && legacy_notes != self.notes_dir {
-            if let Ok(entries) = fs::read_dir(&legacy_notes) {
-                for entry in entries.flatten() {
-                    let src = entry.path();
-                    if let Some(name) = src.file_name() {
-                        let dst = self.notes_dir.join(name);
-                        if !dst.exists() {
-                            let _ = fs::rename(&src, &dst);
-                        }
-                    }
-                }
-            }
-            let is_empty = fs::read_dir(&legacy_notes)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(false);
-            if is_empty {
-                let _ = fs::remove_dir(&legacy_notes);
-            }
-        }
-
-        // Automatically ensure .lee/ is in .gitignore whenever local dirs are created/used
         self.ensure_gitignore(&[".lee/"])?;
         Ok(())
     }
@@ -229,8 +196,6 @@ impl AppPaths {
     pub fn ensure_global_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.global_dir)
             .with_context(|| format!("Failed to create {}", self.global_dir.display()))?;
-        fs::create_dir_all(&self.vault_dir)
-            .with_context(|| format!("Failed to create {}", self.vault_dir.display()))?;
         Ok(())
     }
 
@@ -401,23 +366,6 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_notes_inside_local_dir_and_legacy_migration() {
-        let temp = std::env::temp_dir().join(format!("lee_cfg_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(temp.join(".notes")).unwrap();
-        fs::write(temp.join(".notes/rule.md"), "# Rule\n").unwrap();
-
-        let paths = AppPaths::from_root(temp.clone()).unwrap();
-        assert_eq!(paths.notes_dir, paths.local_dir.join(".notes"));
-        paths.ensure_local_dirs().unwrap();
-
-        assert!(paths.notes_dir.join("rule.md").exists());
-        assert!(!temp.join(".notes").exists());
-
-        let _ = fs::remove_dir_all(&temp);
-    }
 
     #[test]
     fn test_named_workspace_global_docs_and_legacy_sources_migration() {

@@ -1,4 +1,4 @@
--- 1. File Hash Tracker for Lazy Re-indexing (Source Code & .md Documentation)
+-- 1. File Hash Tracker for Lazy Re-indexing (Source Code & .md/.mdx Documentation)
 CREATE TABLE IF NOT EXISTS file_hashes (
     file_path TEXT PRIMARY KEY,
     blake3_hash TEXT NOT NULL,
@@ -22,14 +22,14 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);
 
--- 3. Documentation Section Metadata (.md / .mdx Sections)
+-- 3. Documentation Section Metadata (.md / .mdx Sections & Registered Doc Code Files)
 CREATE TABLE IF NOT EXISTS doc_sections_meta (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_path TEXT NOT NULL,
-    heading TEXT NOT NULL,       -- Section heading (e.g. '### Pixel Spacing & Margin')
+    heading TEXT NOT NULL,       -- Section heading or code filename
     start_line INTEGER NOT NULL,
     end_line INTEGER NOT NULL,
-    content TEXT NOT NULL,       -- Section body text and code snippets
+    content TEXT NOT NULL,       -- Section body text or full code content
     FOREIGN KEY (file_path) REFERENCES file_hashes(file_path) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_doc_sections_file ON doc_sections_meta(file_path);
@@ -67,39 +67,7 @@ CREATE TABLE IF NOT EXISTS handles (
     created_at INTEGER NOT NULL
 );
 
--- 6. Memory Metadata
-CREATE TABLE IF NOT EXISTS memories_meta (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    scope TEXT NOT NULL,         -- 'project', 'global', 'handoff', or 'backlog'
-    topic TEXT NOT NULL,
-    tags TEXT NOT NULL,
-    content TEXT NOT NULL,
-    md_path TEXT,                -- Path to backing Markdown file on disk
-    created_at INTEGER NOT NULL
-);
-
--- 7. Full-Text Search Index for Memories (FTS5 BM25)
-CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-    topic,
-    tags,
-    content,
-    content='memories_meta',
-    content_rowid='id',
-    tokenize='porter unicode61'
-);
-
--- Auto-sync triggers for memories_meta -> memories_fts
-CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories_meta BEGIN
-    INSERT INTO memories_fts(rowid, topic, tags, content)
-    VALUES (new.id, new.topic, new.tags, new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories_meta BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, topic, tags, content)
-    VALUES ('delete', old.id, old.topic, old.tags, old.content);
-END;
-
--- 8. Cross-File Symbol Reference & Call Graph Index
+-- 6. Cross-File Symbol Reference & Call Graph Index
 CREATE TABLE IF NOT EXISTS symbol_refs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol_name TEXT NOT NULL,
@@ -111,4 +79,3 @@ CREATE TABLE IF NOT EXISTS symbol_refs (
 );
 CREATE INDEX IF NOT EXISTS idx_symbol_refs_name ON symbol_refs(symbol_name);
 CREATE INDEX IF NOT EXISTS idx_symbol_refs_file ON symbol_refs(file_path);
-

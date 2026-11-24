@@ -313,11 +313,9 @@ pub fn index_workspace(
     let mut stats = IndexStats::default();
     let mut seen_keys: HashSet<String> = HashSet::with_capacity(files.len());
 
-    let tx = conn.transaction()?;
-
-    // Preload all existing file hashes and timestamps in 1 query for O(1) lookup & mtime fast-path
+    // Preload all existing file hashes and timestamps without opening a write transaction
     let existing_db_map: HashMap<String, (String, i64, usize)> = {
-        let mut stmt = tx.prepare_cached(
+        let mut stmt = conn.prepare_cached(
             "SELECT file_path, blake3_hash, last_indexed, line_count FROM file_hashes",
         )?;
         let rows = stmt
@@ -362,6 +360,7 @@ pub fn index_workspace(
         to_check.push((file_path.clone(), index_key, is_doc_source, expected_suffix));
     }
 
+    let mut to_upsert: Vec<(String, String, parser::ParsedFileResult)> = Vec::new();
     if !to_check.is_empty() {
         let existing_hashes: HashMap<String, String> = existing_db_map
             .iter()
@@ -376,22 +375,34 @@ pub fn index_workspace(
                 stats.files_cached += 1;
             } else if let Some((new_hash, parsed)) = parsed_opt {
                 stats.files_reindexed += 1;
-                upsert_parsed_file(&tx, &index_key, &new_hash, &parsed)?;
+                to_upsert.push((index_key, new_hash, parsed));
             }
         }
     }
 
-    // If this was a full workspace scan, prune any files from SQLite that were deleted/reverted on disk
-    if include_sources {
-        let mut del_stmt = tx.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?;
-        for db_path in existing_db_map.keys() {
-            if !seen_keys.contains(db_path) {
+    let to_delete: Vec<&String> = if include_sources {
+        existing_db_map
+            .keys()
+            .filter(|db_path| !seen_keys.contains(*db_path))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Only open a SQLite write transaction when files actually changed or were deleted
+    if !to_upsert.is_empty() || !to_delete.is_empty() {
+        let tx = conn.transaction()?;
+        for (index_key, new_hash, parsed) in &to_upsert {
+            upsert_parsed_file(&tx, index_key, new_hash, parsed)?;
+        }
+        if !to_delete.is_empty() {
+            let mut del_stmt = tx.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?;
+            for db_path in &to_delete {
                 del_stmt.execute(params![db_path])?;
             }
         }
+        tx.commit()?;
     }
-
-    tx.commit()?;
 
     // Populate total counts from DB
     stats.code_symbols = conn
@@ -442,9 +453,8 @@ pub fn index_global_docs(paths: &AppPaths) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
     let mut seen_keys: HashSet<String> = HashSet::with_capacity(files.len());
 
-    let tx = conn.transaction()?;
     let existing_db_map: HashMap<String, (String, i64, usize)> = {
-        let mut stmt = tx.prepare_cached(
+        let mut stmt = conn.prepare_cached(
             "SELECT file_path, blake3_hash, last_indexed, line_count FROM file_hashes",
         )?;
         let rows = stmt
@@ -484,6 +494,7 @@ pub fn index_global_docs(paths: &AppPaths) -> Result<IndexStats> {
         to_check.push((file_path.clone(), index_key, true, expected_suffix));
     }
 
+    let mut to_upsert: Vec<(String, String, parser::ParsedFileResult)> = Vec::new();
     if !to_check.is_empty() {
         let existing_hashes: HashMap<String, String> = existing_db_map
             .iter()
@@ -498,21 +509,29 @@ pub fn index_global_docs(paths: &AppPaths) -> Result<IndexStats> {
                 stats.files_cached += 1;
             } else if let Some((new_hash, parsed)) = parsed_opt {
                 stats.files_reindexed += 1;
-                upsert_parsed_file(&tx, &index_key, &new_hash, &parsed)?;
+                to_upsert.push((index_key, new_hash, parsed));
             }
         }
     }
 
-    {
-        let mut del_stmt = tx.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?;
-        for db_path in existing_db_map.keys() {
-            if !seen_keys.contains(db_path) {
+    let to_delete: Vec<&String> = existing_db_map
+        .keys()
+        .filter(|db_path| !seen_keys.contains(*db_path))
+        .collect();
+
+    if !to_upsert.is_empty() || !to_delete.is_empty() {
+        let tx = conn.transaction()?;
+        for (index_key, new_hash, parsed) in &to_upsert {
+            upsert_parsed_file(&tx, index_key, new_hash, parsed)?;
+        }
+        if !to_delete.is_empty() {
+            let mut del_stmt = tx.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?;
+            for db_path in &to_delete {
                 del_stmt.execute(params![db_path])?;
             }
         }
+        tx.commit()?;
     }
-
-    tx.commit()?;
 
     stats.code_symbols = conn
         .query_row(
@@ -1536,21 +1555,20 @@ pub fn read_symbol_range(
         };
         (st as usize, en as usize, format!("{name} ({sig})"))
     } else if let (Some(st), Some(en)) = (start_line, end_line) {
-        (
-            st.max(1),
-            en.max(st).min(total_lines),
-            format!("lines {st}..{en}"),
-        )
+        let st_clamped = st.max(1).min(total_lines);
+        let en_clamped = en.max(st_clamped).min(total_lines);
+        (st_clamped, en_clamped, format!("lines {st_clamped}..{en_clamped}"))
     } else if let Some(st) = start_line {
-        let en = end_line.unwrap_or((st + max_lines).min(total_lines));
-        (st.max(1), en, format!("lines {st}..{en}"))
+        let st_clamped = st.max(1).min(total_lines);
+        (st_clamped, total_lines, format!("lines {st_clamped}..{total_lines}"))
     } else {
-        let en = max_lines.max(20).min(total_lines);
-        (1, en, format!("lines 1..{en}"))
+        (1, total_lines, format!("lines 1..{total_lines}"))
     };
 
-    let actual_start = target_start.saturating_sub(context_lines).max(1);
-    let requested_end = (target_end + context_lines).min(total_lines);
+    // Only pad with context_lines for symbol lookups; explicit line-range reads stay exact
+    let effective_context = if symbol.is_some() { context_lines } else { 0 };
+    let actual_start = target_start.saturating_sub(effective_context).max(1);
+    let requested_end = (target_end + effective_context).min(total_lines);
     let max_cap = max_lines.max(20);
     let actual_end = if signatures_only {
         requested_end.min(actual_start + max_cap.saturating_mul(4) - 1)
@@ -1652,9 +1670,10 @@ pub fn read_symbol_range(
     }
 
     if actual_end < requested_end {
+        let next_start = actual_end + 1;
+        let next_end = (actual_end + max_cap).min(requested_end);
         out.push_str(&format!(
-            "... [paginated at {max_cap} lines; call read_symbol(file=\"{index_key}\", start_line={}, end_line={requested_end}) for next slice]\n",
-            actual_end + 1
+            "... [paginated at {max_cap} lines; call read_symbol(file=\"{index_key}\", start_line={next_start}, end_line={next_end}) for next slice]\n"
         ));
     }
     if !other_matches_note.is_empty() {
@@ -1694,8 +1713,8 @@ fn clean_match_line(line: &str, max_len: usize, re: &regex::Regex) -> String {
     }
 }
 
-/// Tool 5: `smart_grep` — RTK-style file-grouped regex search with enclosing AST/Heading context,
-/// `path` directory/file filter, `files_only` (`rg -l`), `case_insensitive`, and `max_per_file` cap.
+/// Tool 6: `smart_grep` — file-grouped regex search with enclosing AST/Heading context,
+/// `path` directory/file filter, `files_only` (`rg -l`), `case_insensitive`, `whole_word` (`rg -w`), and `max_per_file` cap.
 #[allow(clippy::too_many_arguments)]
 pub fn smart_grep_search(
     conn: &Connection,
@@ -1705,14 +1724,25 @@ pub fn smart_grep_search(
     path_filter: Option<&str>,
     files_only: bool,
     case_insensitive: bool,
+    whole_word: bool,
     max_per_file: usize,
     max_results: usize,
 ) -> Result<(String, usize)> {
-    let re = RegexBuilder::new(pattern)
+    let raw_pat = if whole_word {
+        format!(r"\b(?:{pattern})\b")
+    } else {
+        pattern.to_string()
+    };
+    let escaped_pat = if whole_word {
+        format!(r"\b{}\b", regex::escape(pattern))
+    } else {
+        regex::escape(pattern)
+    };
+    let re = RegexBuilder::new(&raw_pat)
         .case_insensitive(case_insensitive)
         .build()
         .or_else(|_| {
-            RegexBuilder::new(&regex::escape(pattern))
+            RegexBuilder::new(&escaped_pat)
                 .case_insensitive(case_insensitive)
                 .build()
         })
@@ -2206,7 +2236,6 @@ mod tests {
         paths.global_dir = temp.join("global_cfg");
         paths.global_db = paths.global_dir.join("global.db");
         paths.global_config_file = paths.global_dir.join("config.json");
-        paths.vault_dir = paths.global_dir.join("vault");
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
 
@@ -2294,7 +2323,6 @@ mod tests {
         paths.global_dir = temp.join("global_cfg");
         paths.global_db = paths.global_dir.join("global.db");
         paths.global_config_file = paths.global_dir.join("config.json");
-        paths.vault_dir = paths.global_dir.join("vault");
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
         paths.add_doc(DocScope::Workspace, &docs_dir, "sdk").unwrap();
@@ -2369,7 +2397,6 @@ mod tests {
         paths.global_dir = temp.join("global_cfg");
         paths.global_db = paths.global_dir.join("global.db");
         paths.global_config_file = paths.global_dir.join("config.json");
-        paths.vault_dir = paths.global_dir.join("vault");
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
 
@@ -2427,6 +2454,85 @@ mod tests {
         let files = collect_workspace_files(&temp, &[]);
         assert!(files.iter().any(|p| p.ends_with("small.rs")));
         assert!(!files.iter().any(|p| p.ends_with("huge.json")));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_read_symbol_exact_range_and_smart_grep_whole_word() {
+        let temp = std::env::temp_dir().join(format!("lee_ux_fix_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(temp.join("src")).unwrap();
+
+        let mut big = String::new();
+        for i in 1..=220 {
+            big.push_str(&format!("// line {i}\n"));
+        }
+        fs::write(temp.join("src/long.rs"), &big).unwrap();
+        fs::write(
+            temp.join("src/words.rs"),
+            "use ort::Session;\nfn sort_report() { let import = 1; }\nfn real_ort() { let ort_val = ort::init(); }\n",
+        )
+        .unwrap();
+
+        let mut paths = AppPaths::from_root(temp.clone()).unwrap();
+        paths.global_dir = temp.join("global_cfg");
+        paths.global_db = paths.global_dir.join("global.db");
+        paths.global_config_file = paths.global_dir.join("config.json");
+        paths.ensure_local_dirs().unwrap();
+
+        let mut conn = init_connection(&paths.local_db).unwrap();
+
+        // Explicit start_line=1, end_line=180 must NOT add context_lines=2 or bogus pagination
+        let (exact_out, _) = read_symbol_range(
+            &mut conn,
+            &paths,
+            Some("src/long.rs"),
+            None,
+            Some(1),
+            Some(180),
+            2,
+            false,
+            false,
+            180,
+        )
+        .unwrap();
+        assert!(exact_out.contains("[1..180 of 220]"));
+        assert!(!exact_out.contains("paginated at"));
+
+        // Manual start_line=1 without end_line paginates cleanly with next slice 181..220
+        let (paged_out, _) = read_symbol_range(
+            &mut conn,
+            &paths,
+            Some("src/long.rs"),
+            None,
+            Some(1),
+            None,
+            2,
+            false,
+            false,
+            180,
+        )
+        .unwrap();
+        assert!(paged_out.contains("start_line=181, end_line=220"));
+
+        // whole_word=true matches `ort` without matching `sort_report` or `import`
+        let (grep_out, _) = smart_grep_search(
+            &conn,
+            &paths,
+            "ort",
+            None,
+            Some("src/words.rs"),
+            false,
+            false,
+            true,
+            10,
+            30,
+        )
+        .unwrap();
+        assert!(grep_out.contains("use ort::Session;"));
+        assert!(grep_out.contains("ort::init()"));
+        assert!(!grep_out.contains("sort_report"));
 
         let _ = fs::remove_dir_all(&temp);
     }

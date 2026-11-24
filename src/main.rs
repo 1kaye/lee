@@ -42,9 +42,9 @@ struct Cli {
 enum Commands {
     /// Run the JSON-RPC 2.0 MCP server over stdin/stdout
     Serve,
-    /// Initialize .lee/, .lee/.notes/, PreToolUse hook, and SQLite FTS5 schemas
+    /// Initialize .lee/, PreToolUse hook, and SQLite FTS5 schemas
     Init {
-        /// Also initialize global vault, database, and hook in ~/.config/lee & ~/.gemini/config/plugins/lee
+        /// Also initialize global database and hook in ~/.config/lee & ~/.gemini/config/plugins/lee
         #[arg(long)]
         global: bool,
     },
@@ -208,10 +208,6 @@ fn cmd_init(paths: &AppPaths, global: bool) -> Result<()> {
     println!(
         "[lee] Initialized local workspace at {}",
         paths.local_dir.display()
-    );
-    println!(
-        "[lee] Notes directory ready at {}",
-        paths.notes_dir.display()
     );
     println!(
         "[lee] Global directory ready at {}",
@@ -656,7 +652,6 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
             "not initialized"
         }
     );
-    println!("Global Vault : {}", paths.vault_dir.display());
 
     if ws_docs.is_empty() {
         println!("Workspace Docs: (none)");
@@ -704,11 +699,8 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
         let handles: i64 = conn
             .query_row("SELECT COUNT(*) FROM handles", [], |r| r.get(0))
             .unwrap_or(0);
-        let memories: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memories_meta", [], |r| r.get(0))
-            .unwrap_or(0);
         println!(
-            "Index Counts : {files} files | {syms} code symbols | {sym_refs} symbol refs | {headings} md headings | {sections} doc windows | {memories} project memories | {handles} handles"
+            "Index Counts : {files} files | {syms} code symbols | {sym_refs} symbol refs | {headings} md headings | {sections} doc windows | {handles} handles"
         );
     }
 
@@ -746,8 +738,9 @@ fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    let has_notes = paths.notes_dir.is_dir()
-        && fs::read_dir(&paths.notes_dir)
+    let legacy_notes_dir = paths.local_dir.join(".notes");
+    let has_notes = legacy_notes_dir.is_dir()
+        && fs::read_dir(&legacy_notes_dir)
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
 
@@ -758,11 +751,11 @@ fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
         );
         if has_notes {
             println!(
-                "  - Markdown notes in {} WILL BE PRESERVED.",
-                paths.notes_dir.display()
+                "  - Existing notes in {} WILL BE PRESERVED.",
+                legacy_notes_dir.display()
             );
         } else {
-            println!("  - .lee/ directory will be removed (no notes found).");
+            println!("  - .lee/ directory will be removed.");
         }
         print!("Proceed with undo? [y/N]: ");
         io::stdout().flush()?;
@@ -799,9 +792,9 @@ fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
         );
     } else if paths.local_dir.exists() {
         println!(
-            "[lee] Undo complete. Removed index/config files in {} (preserved Markdown notes in {}).",
+            "[lee] Undo complete. Removed index/config files in {} (preserved existing notes in {}).",
             paths.local_dir.display(),
-            paths.notes_dir.display()
+            legacy_notes_dir.display()
         );
     } else {
         println!("[lee] Undo complete.");

@@ -57,7 +57,7 @@ pub fn mcp_tools_list() -> Value {
         "tools": [
             {
                 "name": "project_map",
-                "description": "Cold-start codebase & .md map: directory tree, AST symbols, # Headings, and [start..end] line ranges.",
+                "description": "PageRank-prioritized codebase & .md map: directory tree, AST symbols, # Headings, and [start..end] line ranges.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -68,11 +68,11 @@ pub fn mcp_tools_list() -> Value {
             },
             {
                 "name": "outline",
-                "description": "Symbol TOC for code, # headings for .md, or top-level keys for .yml/.toml/.json with [start..end] ranges.",
+                "description": "Symbol TOC for code, # headings for .md/.mdx, or top-level keys for .yml/.toml/.json with [start..end] ranges.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Relative path from root or registered source." },
+                        "file": { "type": "string", "description": "Relative path from root or registered doc." },
                         "max_tokens": { "type": "integer", "description": "Max token budget (default: 1000).", "default": 1000 },
                         "include_tests": { "type": "boolean", "description": "Expand `mod tests` symbols (default: false).", "default": false }
                     },
@@ -81,24 +81,25 @@ pub fn mcp_tools_list() -> Value {
             },
             {
                 "name": "read_symbol",
-                "description": "Read exact lines for a code symbol/function (across workspace if `file` omitted), Markdown heading, config key, or line range.",
+                "description": "Read exact lines for one or more symbols (batch via `symbols`, fuzzy-matched across workspace if `file` omitted), Markdown heading, config key, or line range.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Optional relative file path; omit to search `symbol` across workspace & sources." },
-                        "symbol": { "type": "string", "description": "Function/struct/class/symbol name, Markdown heading, or config key." },
+                        "file": { "type": "string", "description": "Optional relative file path; omit to search across workspace." },
+                        "symbol": { "type": "string", "description": "Single function/struct/class/heading/config key name." },
+                        "symbols": { "type": "array", "items": { "type": "string" }, "description": "Batch list of symbol names to read in one call." },
                         "start_line": { "type": "integer", "description": "1-based start line." },
                         "end_line": { "type": "integer", "description": "1-based end line." },
-                        "context_lines": { "type": "integer", "description": "Context lines around symbol (default: 2).", "default": 2 },
-                        "strip_comments": { "type": "boolean", "description": "Strip non-doc comments to save tokens (default: false).", "default": false },
-                        "signatures_only": { "type": "boolean", "description": "Aggressive filter: keep imports, types, and function signatures while eliding implementation bodies (default: false).", "default": false },
+                        "context_lines": { "type": "integer", "description": "Context lines around symbol (default: 2; 0 for explicit line ranges).", "default": 2 },
+                        "strip_comments": { "type": "boolean", "description": "Strip non-doc comments (default: false).", "default": false },
+                        "signatures_only": { "type": "boolean", "description": "Keep imports, types, and signatures while eliding function bodies (default: false).", "default": false },
                         "max_lines": { "type": "integer", "description": "Max lines per slice before paginating (default: 180).", "default": 180 }
                     }
                 }
             },
             {
                 "name": "find_references",
-                "description": "Find all AST symbol references (call, type_use, import) and enclosing caller functions across the workspace.",
+                "description": "Find all AST symbol references (call, type_use, import), enclosing caller functions, and 2-hop caller impact across the workspace.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -109,22 +110,22 @@ pub fn mcp_tools_list() -> Value {
             },
             {
                 "name": "search_docs",
-                "description": "SQLite FTS5 BM25 search over workspace & global registered docs (.md/.mdx sections and full code files).",
+                "description": "Column-weighted SQLite FTS5 BM25 search over workspace & global registered docs (.md/.mdx fence-safe sections and full multi-language code files).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Topic, API, or concept to search in docs." },
-                        "doc": { "type": "string", "description": "Optional registered doc name (e.g. 'gpui kit') from `lee docs --json`." },
+                        "query": { "type": "string", "description": "Topic, API, or identifier to search in docs." },
+                        "doc": { "type": "string", "description": "Optional registered doc name from `lee docs --json`." },
                         "scope": { "type": "string", "description": "Optional scope: 'workspace', 'global', or 'all' (default: 'all').", "default": "all" },
                         "file_filter": { "type": "string", "description": "Optional substring or glob filter." },
-                        "budget_tokens": { "type": "integer", "description": "Max token budget (default: 800).", "default": 800 }
+                        "budget_tokens": { "type": "integer", "description": "Max token budget (default: 800; top match always intact).", "default": 800 }
                     },
                     "required": ["query"]
                 }
             },
             {
                 "name": "smart_grep",
-                "description": "Grouped regex/text search (replaces rg -l / rg -n) with enclosing AST symbol or # Heading [start..end].",
+                "description": "Grouped regex/text search (replaces rg -l / rg -n / rg -w) with enclosing AST symbol or # Heading [start..end].",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -133,6 +134,7 @@ pub fn mcp_tools_list() -> Value {
                         "glob": { "type": "string", "description": "Optional glob (e.g. '*.rs', '*.md')." },
                         "files_only": { "type": "boolean", "description": "Return matching files + counts only, like rg -l (default: false).", "default": false },
                         "case_insensitive": { "type": "boolean", "description": "Case-insensitive regex match (default: false).", "default": false },
+                        "whole_word": { "type": "boolean", "description": "Match whole words only using \\b boundaries, like rg -w (default: false).", "default": false },
                         "max_per_file": { "type": "integer", "description": "Max matches shown per file (default: 8).", "default": 8 },
                         "max_results": { "type": "integer", "description": "Max total matches (default: 30).", "default": 30 }
                     },
@@ -141,7 +143,7 @@ pub fn mcp_tools_list() -> Value {
             },
             {
                 "name": "run_digest",
-                "description": "Run shell/build/test/diff command; if >35 lines, stores full output as handle h:ID and returns extracted errors/summary.",
+                "description": "Run noisy build/test/diff command; if >35 lines, stores full output as handle h:ID and returns extracted errors/summary.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -165,32 +167,6 @@ pub fn mcp_tools_list() -> Value {
                         "end_line": { "type": "integer", "description": "1-based end line." }
                     },
                     "required": ["key"]
-                }
-            },
-            {
-                "name": "remember",
-                "description": "Append decision, rule, session handoff, or backlog item to Markdown (.lee/.notes/ or global vault) with [[wikilinks]] & FTS5 index.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "topic": { "type": "string", "description": "Short title/topic." },
-                        "content": { "type": "string", "description": "Rule, decision, handoff state, or backlog task (supports [[wikilinks]])." },
-                        "tags": { "type": "string", "description": "Comma-separated tags." },
-                        "scope": { "type": "string", "description": "'project' (default), 'global', 'handoff', or 'backlog'.", "default": "project" }
-                    },
-                    "required": ["topic", "content"]
-                }
-            },
-            {
-                "name": "recall_memory",
-                "description": "SQLite FTS5 BM25 recall over project/global/handoff/backlog memories + 1-hop [[wikilinks]].",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string", "description": "Context keywords or topic to recall." },
-                        "budget_tokens": { "type": "integer", "description": "Max token budget (default: 600).", "default": 600 }
-                    },
-                    "required": ["query"]
                 }
             }
         ]
