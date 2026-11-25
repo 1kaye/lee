@@ -41,11 +41,25 @@ impl JsonRpcResponse {
 }
 
 pub fn mcp_tools_list() -> Value {
+    let read_only = json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+    });
+    let exec_tool = json!({
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+    });
+
     json!({
         "tools": [
             {
                 "name": "project_map",
                 "description": "PageRank-prioritized codebase & .md map: directory tree, AST symbols, # Headings, and [start..end] line ranges.",
+                "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -57,6 +71,7 @@ pub fn mcp_tools_list() -> Value {
             {
                 "name": "outline",
                 "description": "Symbol TOC for code, # headings for .md/.mdx, or top-level keys for .yml/.toml/.json with [start..end] ranges.",
+                "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -70,6 +85,7 @@ pub fn mcp_tools_list() -> Value {
             {
                 "name": "read_symbol",
                 "description": "Read exact lines for one or more symbols (`symbol` or batch `symbols`; fuzzy-matched across workspace if `file` omitted), heading, config key, or line range. Provide `file`, `symbol`, or `symbols`.",
+                "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -88,6 +104,7 @@ pub fn mcp_tools_list() -> Value {
             {
                 "name": "find_references",
                 "description": "Find AST symbol references (call, type_use, import), enclosing caller functions, and 2-hop caller impact across the workspace.",
+                "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -99,6 +116,7 @@ pub fn mcp_tools_list() -> Value {
             {
                 "name": "search_docs",
                 "description": "Column-weighted SQLite FTS5 BM25 search over workspace & global registered docs (.md/.mdx fence-safe sections and full multi-language code files).",
+                "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -114,6 +132,7 @@ pub fn mcp_tools_list() -> Value {
             {
                 "name": "smart_grep",
                 "description": "Grouped regex/text search (replaces rg -l / rg -n / rg -w) with enclosing AST symbol or # Heading [start..end].",
+                "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -132,6 +151,7 @@ pub fn mcp_tools_list() -> Value {
             {
                 "name": "run_digest",
                 "description": "Run noisy build/test/diff command; if >35 lines, stores full output as handle h:ID and returns extracted errors/summary.",
+                "annotations": exec_tool,
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -144,6 +164,7 @@ pub fn mcp_tools_list() -> Value {
             {
                 "name": "recall",
                 "description": "Pull a specific item block (test/fn/diff file), failures, regex filter (+3 context lines), or line range (default: lines 1..80) from handle h:ID. Precedence: item > failures_only > filter > line range.",
+                "annotations": read_only,
                 "inputSchema": {
                     "type": "object",
                     "properties": {

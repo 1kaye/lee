@@ -364,22 +364,24 @@ mod tests {
             -32602
         );
 
-        // 1. tools/list
+        // 1. tools/list (8 tools + MCP readOnlyHint annotations)
         let list_resp = handle_jsonrpc_message(
             &mut conn,
             &paths,
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         )
         .unwrap();
-        let tools_arr = list_resp
-            .result
-            .unwrap()
-            .get("tools")
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .len();
-        assert_eq!(tools_arr, 8);
+        let list_res = list_resp.result.unwrap();
+        let tools = list_res.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools.len(), 8);
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let expected_ro = name != "run_digest";
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"], expected_ro,
+                "Unexpected readOnlyHint for tool {name}"
+            );
+        }
 
         // 2. project_map (success omits redundant `isError`)
         let map_resp = handle_jsonrpc_message(
