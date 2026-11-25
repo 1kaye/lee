@@ -1,15 +1,18 @@
 use crate::security::validate_command;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-pub const ANTIGRAVITY_PLUGIN_JSON: &str = r#"{
-  "name": "lee",
-  "version": "0.1.0",
-  "description": "Locate Exact Elements — Antigravity PreToolUse hook plugin for transparent command digesting and token optimization using lee"
+fn antigravity_plugin_json() -> String {
+    serde_json::to_string_pretty(&json!({
+        "name": "lee",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Locate Exact Elements — Antigravity PreToolUse hook plugin for transparent command digesting and token optimization using lee"
+    }))
+    .unwrap_or_default()
+        + "\n"
 }
-"#;
 
 pub const ANTIGRAVITY_HOOKS_JSON: &str = r#"{
   "lee-rewrite": {
@@ -55,21 +58,13 @@ pub fn update_managed_block_if_changed(existing: &str, latest_block: &str) -> Op
     Some(updated)
 }
 
-/// Automatically synchronizes Antigravity plugin `rules/AGENTS.md`, `~/.config/lee/AGENTS.md` (when global),
+/// Synchronizes Antigravity plugin `rules/AGENTS.md`, `~/.config/lee/AGENTS.md`,
 /// and any `<!-- lee:start --> ... <!-- lee:end -->` block in `<root>/AGENTS.md`
-/// or `<root>/CLAUDE.md` whenever `AGENTS_MD_RULES` changes in a new version of `lee`.
-/// Also cleans up redundant `.lee/AGENTS.md` if present.
+/// or `<root>/CLAUDE.md` whenever `AGENTS_MD_RULES` changes.
 pub fn auto_sync_agents_md(paths: &crate::config::AppPaths, latest_rules: &str) -> usize {
     let mut updated_count = 0usize;
     let normalized = latest_rules.trim_start();
 
-    // 1. Clean up redundant local `AGENTS.md` inside `.lee/` (rules live in `.agents/plugins/lee/rules/AGENTS.md`)
-    let legacy_local_agents = paths.local_dir.join("AGENTS.md");
-    if legacy_local_agents.is_file() {
-        let _ = fs::remove_file(&legacy_local_agents);
-    }
-
-    // 2. Sync ~/.config/lee/AGENTS.md if it exists
     let global_agents = paths.global_dir.join("AGENTS.md");
     if global_agents.is_file()
         && let Ok(curr) = fs::read_to_string(&global_agents)
@@ -79,7 +74,6 @@ pub fn auto_sync_agents_md(paths: &crate::config::AppPaths, latest_rules: &str) 
         updated_count += 1;
     }
 
-    // 3. Sync managed <!-- lee:start -->...<!-- lee:end --> blocks in root AGENTS.md & CLAUDE.md
     for fname in ["AGENTS.md", "CLAUDE.md"] {
         let target = paths.project_root.join(fname);
         if target.is_file()
@@ -91,7 +85,6 @@ pub fn auto_sync_agents_md(paths: &crate::config::AppPaths, latest_rules: &str) 
         }
     }
 
-    // 4. Sync Antigravity plugin rules/AGENTS.md if plugin is installed
     let mut plugin_dirs = vec![paths.project_root.join(".agents/plugins/lee")];
     if let Some(home) = dirs::home_dir() {
         plugin_dirs.push(home.join(".gemini/config/plugins/lee"));
@@ -110,6 +103,24 @@ pub fn auto_sync_agents_md(paths: &crate::config::AppPaths, latest_rules: &str) 
     updated_count
 }
 
+fn has_machine_readable_flag(cmd: &str) -> bool {
+    cmd.split_whitespace().any(|tok| {
+        matches!(
+            tok,
+            "--json"
+                | "-json"
+                | "--porcelain"
+                | "--short"
+                | "-s"
+                | "--name-only"
+                | "--oneline"
+        ) || tok.starts_with("--porcelain=")
+            || tok.starts_with("--format=")
+            || tok.starts_with("--pretty=")
+            || tok.starts_with("--message-format=")
+    })
+}
+
 /// Determines whether a raw shell command should be transparently rewritten to `lee exec '<cmd>'`.
 pub fn rewrite_shell_command_for_hook(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
@@ -119,8 +130,24 @@ pub fn rewrite_shell_command_for_hook(cmd: &str) -> Option<String> {
         || trimmed.contains('\n')
         || trimmed.contains("<<")
         || trimmed.contains('|')
+        || trimmed.contains('>')
+        || trimmed.contains('<')
+        || trimmed.contains(';')
+        || has_machine_readable_flag(trimmed)
     {
         return None;
+    }
+
+    // Reject single `&` (backgrounding) while permitting `&&`
+    let bytes = trimmed.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'&' {
+            let prev_amp = i > 0 && bytes[i - 1] == b'&';
+            let next_amp = i + 1 < bytes.len() && bytes[i + 1] == b'&';
+            if !prev_amp && !next_amp {
+                return None;
+            }
+        }
     }
 
     if validate_command(trimmed).is_err() {
@@ -150,10 +177,11 @@ pub fn rewrite_shell_command_for_hook(cmd: &str) -> Option<String> {
         "go test",
     ];
 
-    let matches_target = prefixes.iter().any(|p| {
-        trimmed == *p
-            || trimmed.starts_with(&format!("{p} "))
-            || trimmed.contains(&format!("&& {p}"))
+    let matches_target = trimmed.split("&&").any(|seg| {
+        let s = seg.trim();
+        prefixes
+            .iter()
+            .any(|p| s == *p || s.starts_with(&format!("{p} ")))
     });
 
     if !matches_target {
@@ -185,20 +213,24 @@ pub fn process_antigravity_hook(input: &str) -> Value {
         return json!({ "decision": "allow" });
     }
 
-    let cmd = parsed
-        .pointer("/toolCall/args/CommandLine")
-        .or_else(|| parsed.pointer("/toolCall/args/command"))
-        .or_else(|| parsed.pointer("/toolCall/args/cmd"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let Some(args_obj) = parsed.pointer("/toolCall/args").and_then(|v| v.as_object()) else {
+        return json!({ "decision": "allow" });
+    };
+
+    let Some((key, cmd)) = ["CommandLine", "command", "cmd"]
+        .into_iter()
+        .find_map(|k| args_obj.get(k).and_then(|v| v.as_str()).map(|s| (k, s)))
+    else {
+        return json!({ "decision": "allow" });
+    };
 
     if let Some(rewritten) = rewrite_shell_command_for_hook(cmd) {
+        let mut overwrite = serde_json::Map::new();
+        overwrite.insert(key.to_string(), Value::String(rewritten));
         json!({
             "decision": "allow",
             "reason": "Rewritten by lee for token optimization.",
-            "overwrite": {
-                "CommandLine": rewritten
-            }
+            "overwrite": overwrite
         })
     } else {
         json!({ "decision": "allow" })
@@ -236,22 +268,17 @@ pub fn process_claude_hook(input: &str) -> Option<Value> {
     }))
 }
 
-/// Installs the Antigravity `PreToolUse` plugin (`plugin.json`, `hooks.json`, and `rules/AGENTS.md`).
-pub fn install_antigravity_hook_plugin(
-    project_root: &Path,
-    global: bool,
-    rules_content: &str,
-) -> Result<PathBuf> {
-    let plugin_dir = if global {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(".gemini/config/plugins/lee")
-    } else {
-        project_root.join(".agents/plugins/lee")
+/// Installs the Antigravity `PreToolUse` plugin globally at `~/.gemini/config/plugins/lee/`
+/// (`plugin.json`, `hooks.json`, and `rules/AGENTS.md`) so every project works with zero repo files.
+pub fn install_antigravity_hook_plugin(rules_content: &str) -> Result<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        bail!("Could not determine home directory to install Antigravity plugin");
     };
+    let plugin_dir = home.join(".gemini/config/plugins/lee");
 
     let rules_dir = plugin_dir.join("rules");
     fs::create_dir_all(&rules_dir)?;
-    fs::write(plugin_dir.join("plugin.json"), ANTIGRAVITY_PLUGIN_JSON)?;
+    fs::write(plugin_dir.join("plugin.json"), antigravity_plugin_json())?;
     fs::write(plugin_dir.join("hooks.json"), ANTIGRAVITY_HOOKS_JSON)?;
     fs::write(rules_dir.join("AGENTS.md"), rules_content.trim_start())?;
 
@@ -261,8 +288,6 @@ pub fn install_antigravity_hook_plugin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::digest::cargo::parse_cargo_output_with_cmd;
-    use crate::digest::generic::parse_git_status_or_log_output;
 
     #[test]
     fn test_antigravity_and_claude_pre_tool_use_hooks() {
@@ -274,8 +299,13 @@ mod tests {
             "lee exec 'cargo clippy --all-targets'"
         );
 
-        let claude_payload =
-            r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+        // Overwrites the exact input key (`command` / `cmd`), not always `CommandLine`
+        let agy_cmd = r#"{"toolCall":{"name":"run_command","args":{"command":"git diff"}}}"#;
+        let agy_cmd_resp = process_antigravity_hook(agy_cmd);
+        assert_eq!(agy_cmd_resp["overwrite"]["command"], "lee exec 'git diff'");
+        assert!(agy_cmd_resp["overwrite"].get("CommandLine").is_none());
+
+        let claude_payload = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
         let claude_resp = process_claude_hook(claude_payload).unwrap();
         assert_eq!(
             claude_resp["hookSpecificOutput"]["updatedInput"]["command"],
@@ -286,6 +316,18 @@ mod tests {
         let pass_resp = process_antigravity_hook(passthrough);
         assert_eq!(pass_resp["decision"], "allow");
         assert!(pass_resp.get("overwrite").is_none());
+
+        // Single-quote escaping, machine-readable flag skipping, redirections, and denied commands
+        assert_eq!(
+            rewrite_shell_command_for_hook("git diff -- 'a b'").as_deref(),
+            Some("lee exec 'git diff -- '\\''a b'\\'''")
+        );
+        assert!(rewrite_shell_command_for_hook("kaye status --json").is_none());
+        assert!(rewrite_shell_command_for_hook("git status --porcelain").is_none());
+        assert!(rewrite_shell_command_for_hook("cargo test > out.txt").is_none());
+        assert!(rewrite_shell_command_for_hook("cargo test &").is_none());
+        assert!(rewrite_shell_command_for_hook("cargo test && cat .env").is_none());
+        assert!(rewrite_shell_command_for_hook("echo hi && cargo tester").is_none());
     }
 
     #[test]
@@ -299,59 +341,6 @@ mod tests {
         );
         // Second call with identical content returns None (no redundant write)
         assert!(update_managed_block_if_changed(&patched, latest).is_none());
-    }
-
-    #[test]
-    fn test_clippy_rule_grouping_and_nocapture_flag() {
-        let raw_clippy = "\
-Checking foo v0.1.0
-warning: unused variable: `x`
- --> src/lib.rs:10:9
-  |
-  = note: `#[warn(unused_variables)]` on by default
-
-warning: unused variable: `y`
- --> src/lib.rs:20:9
-  |
-  = note: `#[warn(unused_variables)]` on by default
-
-warning: this expression borrows a reference
- --> src/main.rs:42:5
-  |
-  = note: `#[warn(clippy::needless_borrow)]` on by default
-
-Finished `dev` profile in 0.50s";
-
-        let parsed = parse_cargo_output_with_cmd("cargo clippy", raw_clippy, Some(0));
-        let summary = parsed.summary_lines.join("\n");
-        assert!(summary.contains("Grouped Lint/Compiler Rules (2 distinct):"));
-        assert!(summary.contains("`unused_variables` (2x): src/lib.rs:10:9, src/lib.rs:20:9"));
-        assert!(summary.contains("`clippy::needless_borrow` (1x): src/main.rs:42:5"));
-
-        let raw_nocapture = "\
-running 1 test
----- tests::my_debug_test stdout ----
-DEBUG_VALUE = 12345
-
-test result: ok. 1 passed; 0 failed;";
-        let parsed_nc =
-            parse_cargo_output_with_cmd("cargo test -- --nocapture", raw_nocapture, Some(0));
-        assert!(parsed_nc.summary_lines.join("\n").contains("DEBUG_VALUE = 12345"));
-    }
-
-    #[test]
-    fn test_git_status_and_log_compressors() {
-        let raw_status = "\
-On branch main
-Changes not staged for commit:
-  (use \"git add <file>...\" to update what will be committed)
-  (use \"git restore <file>...\" to discard changes in working directory)
-\tmodified:   src/main.rs
-no changes added to commit (use \"git add\" and/or \"git commit -a\")";
-        let st = parse_git_status_or_log_output("git status", raw_status, Some(0));
-        let joined = st.summary_lines.join("\n");
-        assert!(joined.contains("modified:   src/main.rs"));
-        assert!(!joined.contains("use \"git add"));
     }
 }
 

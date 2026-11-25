@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_path TEXT NOT NULL,
     name TEXT NOT NULL,
-    kind TEXT NOT NULL,          -- 'fn', 'struct', 'enum', 'trait', 'impl', 'interface', 'class', 'type', 'mod', 'md_heading'
+    kind TEXT NOT NULL,          -- 'fn', 'struct', 'enum', 'trait', 'impl', 'interface', 'class', 'type', 'mod', 'const', 'macro', 'key', 'md_heading'
     signature TEXT NOT NULL,     -- Declaration line for code symbols or full heading text (e.g. '## Grid Layout')
     start_line INTEGER NOT NULL,
     end_line INTEGER NOT NULL,
@@ -53,6 +53,13 @@ END;
 CREATE TRIGGER IF NOT EXISTS doc_sections_ad AFTER DELETE ON doc_sections_meta BEGIN
     INSERT INTO doc_sections_fts(doc_sections_fts, rowid, file_path, heading, content)
     VALUES ('delete', old.id, old.file_path, old.heading, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS doc_sections_au AFTER UPDATE ON doc_sections_meta BEGIN
+    INSERT INTO doc_sections_fts(doc_sections_fts, rowid, file_path, heading, content)
+    VALUES ('delete', old.id, old.file_path, old.heading, old.content);
+    INSERT INTO doc_sections_fts(rowid, file_path, heading, content)
+    VALUES (new.id, new.file_path, new.heading, new.content);
 END;
 
 -- 5. Large Output Handle Store (Handles h:ID)

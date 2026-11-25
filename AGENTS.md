@@ -13,7 +13,8 @@ Prefer `lee` MCP tools for large files, AST navigation, refactoring impact, docs
 - **`run_digest(command, cwd?)` + `recall(key, item?, failures_only?, filter?)`**: Compress noisy build/test/diff logs (>35 lines stored as `h:ID`; <=35 lines returned raw).
 
 ## CLI
-- `lee init [--global]` | `lee index` | `lee status` | `lee undo [-y]`
+- `lee init` (one-time global setup; zero `.lee/` files created in repos — per-project caches live in `~/.config/lee/projects/`)
+- `lee index` | `lee status` | `lee undo [-y]`
 - `lee add-docs <path> [--w|--g] [--name <name>]` | `lee rm-docs [target|--all] [--w|--g]`
 - `lee docs [--json]` | `lee docs update` (incremental sync; skips unchanged docs)
 - `lee exec <cmd...>` (digest wrapper used by PreToolUse hook)

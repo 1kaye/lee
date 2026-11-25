@@ -36,7 +36,6 @@ pub const COALESCE_MAX_LINES: usize = 120;
 pub const COALESCE_MAX_BYTES: usize = 3600;
 
 struct RawHeading {
-    level: usize,
     title: String,
     full_line: String,
     line_num: usize, // 1-based
@@ -56,7 +55,11 @@ pub fn parse_markdown(source: &str) -> ParsedMarkdown {
     let mut in_fence = false;
     let mut fence_marker: char = '`';
     let mut fence_len: usize = 0;
-    let mut in_frontmatter = lines.first().map(|l| l.trim() == "---").unwrap_or(false);
+    let mut in_frontmatter = lines.first().map(|l| l.trim() == "---").unwrap_or(false)
+        && lines
+            .iter()
+            .skip(1)
+            .any(|l| matches!(l.trim(), "---" | "..."));
 
     let mut headings: Vec<RawHeading> = Vec::new();
     let mut stack: Vec<(usize, String)> = Vec::new();
@@ -91,27 +94,27 @@ pub fn parse_markdown(source: &str) -> ParsedMarkdown {
             continue;
         }
 
-        if let Some((level, title)) = parse_atx_heading(trimmed_start) {
-            if (1..=4).contains(&level) && !title.is_empty() {
-                while let Some((top_lvl, _)) = stack.last() {
-                    if *top_lvl >= level {
-                        stack.pop();
-                    } else {
-                        break;
-                    }
+        if let Some((level, title)) = parse_atx_heading(trimmed_start)
+            && (1..=4).contains(&level)
+            && !title.is_empty()
+        {
+            while let Some((top_lvl, _)) = stack.last() {
+                if *top_lvl >= level {
+                    stack.pop();
+                } else {
+                    break;
                 }
-                let parent_name = stack.last().map(|(_, t)| t.clone());
-                let full_line = format!("{} {}", "#".repeat(level), title);
-                stack.push((level, title.clone()));
-
-                headings.push(RawHeading {
-                    level,
-                    title,
-                    full_line,
-                    line_num,
-                    parent_name,
-                });
             }
+            let parent_name = stack.last().map(|(_, t)| t.clone());
+            let full_line = format!("{} {}", "#".repeat(level), title);
+            stack.push((level, title.clone()));
+
+            headings.push(RawHeading {
+                title,
+                full_line,
+                line_num,
+                parent_name,
+            });
         }
     }
 
@@ -146,7 +149,6 @@ pub fn parse_markdown(source: &str) -> ParsedMarkdown {
         }
         .max(start_line);
 
-        let _ = h.level;
         symbols.push(ExtractedSymbol {
             name: h.title.clone(),
             kind: "md_heading".to_string(),
@@ -293,11 +295,13 @@ fn detect_fence(trimmed: &str) -> Option<(char, usize)> {
         return None;
     }
     let count = trimmed.chars().take_while(|&c| c == first).count();
-    if count >= 3 {
-        Some((first, count))
-    } else {
-        None
+    if count < 3 {
+        return None;
     }
+    if first == '`' && trimmed[count..].contains('`') {
+        return None;
+    }
+    Some((first, count))
 }
 
 fn parse_atx_heading(trimmed: &str) -> Option<(usize, String)> {
@@ -309,8 +313,14 @@ fn parse_atx_heading(trimmed: &str) -> Option<(usize, String)> {
     if !rest.starts_with(' ') && !rest.starts_with('\t') {
         return None;
     }
-    let title = rest.trim().trim_end_matches('#').trim().to_string();
-    Some((hashes, title))
+    let mut title = rest.trim();
+    let stripped = title.trim_end_matches('#');
+    if stripped.len() < title.len()
+        && (stripped.is_empty() || stripped.ends_with(' ') || stripped.ends_with('\t'))
+    {
+        title = stripped.trim_end();
+    }
+    Some((hashes, title.to_string()))
 }
 
 #[cfg(test)]
@@ -430,5 +440,13 @@ Body text.
         // Window 2 starts cleanly after the fence without partial code lines
         assert!(!parsed.sections[1].content.contains("const v40"));
         assert!(parsed.sections[1].content.contains("After code line 1"));
+    }
+
+    #[test]
+    fn test_markdown_edge_cases_inline_backticks_unclosed_hr_and_csharp_heading() {
+        let md = "---\n# Intro\n```inline_code``` on a single line\n## C#\n## Trailing ##\n";
+        let parsed = parse_markdown(md);
+        let names: Vec<&str> = parsed.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Intro", "C#", "Trailing"]);
     }
 }

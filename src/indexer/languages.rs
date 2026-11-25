@@ -42,11 +42,6 @@ impl CodeLanguage {
     }
 }
 
-pub fn extract_code_symbols(lang: CodeLanguage, source: &str) -> Result<Vec<ExtractedSymbol>> {
-    let (syms, _) = extract_code_symbols_and_refs(lang, source)?;
-    Ok(syms)
-}
-
 pub fn extract_code_symbols_and_refs(
     lang: CodeLanguage,
     source: &str,
@@ -147,7 +142,14 @@ fn extract_svelte_symbols_and_refs(
 
 fn dedup_refs(refs: &mut Vec<ExtractedSymbolRef>) {
     let mut seen = HashSet::with_capacity(refs.len());
-    refs.retain(|r| seen.insert((r.symbol_name.clone(), r.line_number)));
+    refs.retain(|r| {
+        seen.insert((
+            r.symbol_name.clone(),
+            r.line_number,
+            r.ref_kind.clone(),
+            r.caller_symbol.clone(),
+        ))
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -228,12 +230,12 @@ fn walk_node(
                                 }
                             }
                             "scoped_identifier" => {
-                                if let Some(path_node) = fn_node.child_by_field_name("path") {
-                                    if let Some(type_or_mod) = terminal_identifier(path_node, source_bytes) {
-                                        if is_upper_ident(&type_or_mod) {
-                                            push_ref(refs_out, &type_or_mod, caller_fn, line_number, "call");
-                                        }
-                                    }
+                                if let Some(path_node) = fn_node.child_by_field_name("path")
+                                    && let Some(type_or_mod) =
+                                        terminal_identifier(path_node, source_bytes)
+                                    && is_upper_ident(&type_or_mod)
+                                {
+                                    push_ref(refs_out, &type_or_mod, caller_fn, line_number, "call");
                                 }
                                 if let Some(nm) = node_field_text(fn_node, "name", source_bytes) {
                                     push_ref(refs_out, &nm, caller_fn, line_number, "call");
@@ -244,22 +246,22 @@ fn walk_node(
                     }
                 }
                 "type_identifier" => {
-                    if !is_type_declaration_name(node) {
-                        if let Ok(txt) = node.utf8_text(source_bytes) {
-                            push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
-                        }
+                    if !is_type_declaration_name(node)
+                        && let Ok(txt) = node.utf8_text(source_bytes)
+                    {
+                        push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
                     }
                 }
                 "scoped_identifier" => {
                     let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
-                    if !matches!(parent_kind, "call_expression" | "generic_function" | "scoped_identifier") {
-                        if let Some(path_node) = node.child_by_field_name("path") {
-                            if let Some(type_name) = terminal_identifier(path_node, source_bytes) {
-                                if is_upper_ident(&type_name) {
-                                    push_ref(refs_out, &type_name, caller_fn, line_number, "type_use");
-                                }
-                            }
-                        }
+                    if !matches!(
+                        parent_kind,
+                        "call_expression" | "generic_function" | "scoped_identifier"
+                    ) && let Some(path_node) = node.child_by_field_name("path")
+                        && let Some(type_name) = terminal_identifier(path_node, source_bytes)
+                        && is_upper_ident(&type_name)
+                    {
+                        push_ref(refs_out, &type_name, caller_fn, line_number, "type_use");
                     }
                 }
                 _ => {}
@@ -361,10 +363,10 @@ fn walk_node(
                     }
                 }
                 "type_identifier" => {
-                    if !is_type_declaration_name(node) {
-                        if let Ok(txt) = node.utf8_text(source_bytes) {
-                            push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
-                        }
+                    if !is_type_declaration_name(node)
+                        && let Ok(txt) = node.utf8_text(source_bytes)
+                    {
+                        push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
                     }
                 }
                 _ => {}
@@ -375,10 +377,11 @@ fn walk_node(
                 let mod_id = node.child_by_field_name("module_name").map(|n| n.id());
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    if Some(child.id()) != mod_id && (child.kind() == "dotted_name" || child.kind() == "aliased_import") {
-                        if let Some(ident) = terminal_identifier(child, source_bytes) {
-                            push_ref(refs_out, &ident, caller_fn, line_number, "import");
-                        }
+                    if Some(child.id()) != mod_id
+                        && (child.kind() == "dotted_name" || child.kind() == "aliased_import")
+                        && let Some(ident) = terminal_identifier(child, source_bytes)
+                    {
+                        push_ref(refs_out, &ident, caller_fn, line_number, "import");
                     }
                 }
                 return;
@@ -473,10 +476,10 @@ fn walk_node(
                 }
             }
             "type_identifier" => {
-                if !is_type_declaration_name(node) {
-                    if let Ok(txt) = node.utf8_text(source_bytes) {
-                        push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
-                    }
+                if !is_type_declaration_name(node)
+                    && let Ok(txt) = node.utf8_text(source_bytes)
+                {
+                    push_ref(refs_out, txt.trim(), caller_fn, line_number, "type_use");
                 }
             }
             _ => {}
@@ -534,7 +537,7 @@ fn is_type_declaration_name(node: Node) -> bool {
     ) {
         return true;
     }
-    if matches!(
+    matches!(
         pk,
         "struct_item"
             | "enum_item"
@@ -546,14 +549,9 @@ fn is_type_declaration_name(node: Node) -> bool {
             | "enum_declaration"
             | "type_spec"
             | "type_alias"
-    ) {
-        if let Some(name_node) = parent.child_by_field_name("name") {
-            if name_node.id() == node.id() {
-                return true;
-            }
-        }
-    }
-    false
+    ) && parent
+        .child_by_field_name("name")
+        .is_some_and(|name_node| name_node.id() == node.id())
 }
 
 fn terminal_identifier(node: Node, source_bytes: &[u8]) -> Option<String> {
@@ -646,10 +644,10 @@ fn node_field_text(node: Node, field: &str, source_bytes: &[u8]) -> Option<Strin
 fn first_identifier_child(node: Node, source_bytes: &[u8]) -> String {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind().contains("identifier") {
-            if let Ok(s) = child.utf8_text(source_bytes) {
-                return s.trim().to_string();
-            }
+        if child.kind().contains("identifier")
+            && let Ok(s) = child.utf8_text(source_bytes)
+        {
+            return s.trim().to_string();
         }
     }
     String::new()

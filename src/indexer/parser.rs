@@ -130,7 +130,7 @@ fn extract_config_symbols(fmt: ConfigFormat, source: &str) -> Vec<ExtractedSymbo
         ConfigFormat::Toml => {
             for (idx, line) in lines.iter().enumerate() {
                 let t = line.trim();
-                if t.starts_with('[') && t.ends_with(']') && !t.starts_with('#') {
+                if t.starts_with('[') && t.ends_with(']') {
                     let name = t.trim_matches(|c| c == '[' || c == ']').trim().to_string();
                     if !name.is_empty() {
                         raw.push((name, t.to_string(), idx + 1, None));
@@ -146,21 +146,22 @@ fn extract_config_symbols(fmt: ConfigFormat, source: &str) -> Vec<ExtractedSymbo
                 }
                 let indent = line.len() - line.trim_start().len();
                 let trimmed = line.trim();
-                if indent <= 2 && !trimmed.starts_with('-') {
-                    if let Some((key, _)) = trimmed.split_once(':') {
-                        let clean_key = key.trim().trim_matches(|c| c == '"' || c == '\'');
-                        if !clean_key.is_empty() {
-                            if indent == 0 {
-                                top_parent = Some(clean_key.to_string());
-                                raw.push((clean_key.to_string(), trimmed.to_string(), idx + 1, None));
-                            } else {
-                                raw.push((
-                                    clean_key.to_string(),
-                                    trimmed.to_string(),
-                                    idx + 1,
-                                    top_parent.clone(),
-                                ));
-                            }
+                if indent <= 2
+                    && !trimmed.starts_with('-')
+                    && let Some((key, _)) = trimmed.split_once(':')
+                {
+                    let clean_key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+                    if !clean_key.is_empty() {
+                        if indent == 0 {
+                            top_parent = Some(clean_key.to_string());
+                            raw.push((clean_key.to_string(), trimmed.to_string(), idx + 1, None));
+                        } else {
+                            raw.push((
+                                clean_key.to_string(),
+                                trimmed.to_string(),
+                                idx + 1,
+                                top_parent.clone(),
+                            ));
                         }
                     }
                 }
@@ -171,25 +172,26 @@ fn extract_config_symbols(fmt: ConfigFormat, source: &str) -> Vec<ExtractedSymbo
                 let indent = line.len() - line.trim_start().len();
                 let trimmed = line.trim();
                 // Capture top-level or 1st-nested JSON keys with compact schema summary
-                if indent <= 4 && trimmed.starts_with('"') {
-                    if let Some((key_part, val_part)) = trimmed.split_once(':') {
-                        let key = key_part.trim().trim_matches('"');
-                        if !key.is_empty() {
-                            let val_trim = val_part.trim().trim_end_matches(',');
-                            let val_hint = if val_trim.starts_with('{') {
-                                "{...}"
-                            } else if val_trim.starts_with('[') {
-                                "[...]"
-                            } else {
-                                val_trim
-                            };
-                            raw.push((
-                                key.to_string(),
-                                format!("{key}: {val_hint}"),
-                                idx + 1,
-                                None,
-                            ));
-                        }
+                if indent <= 4
+                    && trimmed.starts_with('"')
+                    && let Some((key_part, val_part)) = trimmed.split_once(':')
+                {
+                    let key = key_part.trim().trim_matches('"');
+                    if !key.is_empty() {
+                        let val_trim = val_part.trim().trim_end_matches(',');
+                        let val_hint = if val_trim.starts_with('{') {
+                            "{...}"
+                        } else if val_trim.starts_with('[') {
+                            "[...]"
+                        } else {
+                            val_trim
+                        };
+                        raw.push((
+                            key.to_string(),
+                            format!("{key}: {val_hint}"),
+                            idx + 1,
+                            None,
+                        ));
                     }
                 }
             }
@@ -230,7 +232,11 @@ pub fn is_non_doc_comment_line(line: &str, hash_comments: bool) -> bool {
         return t.starts_with('#') && !t.starts_with("#!");
     }
     (t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!"))
-        || (t.starts_with("/*") && t.ends_with("*/") && !t.starts_with("/**"))
+        || (t.len() >= 4
+            && t.starts_with("/*")
+            && t.ends_with("*/")
+            && !t.starts_with("/**")
+            && !t[2..t.len() - 2].contains("*/"))
 }
 
 #[cfg(test)]
@@ -325,5 +331,16 @@ export const fetchUser = async (id: string) => {
             .unwrap();
         assert!(toml_res.symbols.iter().any(|s| s.name == "package" && s.end_line == 2));
         assert!(toml_res.symbols.iter().any(|s| s.name == "dependencies" && s.start_line == 3));
+    }
+
+    #[test]
+    fn test_is_non_doc_comment_line_preserves_code_between_block_comments() {
+        assert!(is_non_doc_comment_line("  /* pure comment */  ", false));
+        assert!(!is_non_doc_comment_line("/* a */ do_work(); /* b */", false));
+        assert!(!is_non_doc_comment_line("/** doc comment */", false));
+        assert!(!is_non_doc_comment_line("/// rust doc", false));
+        assert!(is_non_doc_comment_line("// plain comment", false));
+        assert!(is_non_doc_comment_line("# py comment", true));
+        assert!(!is_non_doc_comment_line("#!/usr/bin/env python3", true));
     }
 }

@@ -7,7 +7,9 @@ use crate::db::{init_connection, now_unix};
 use crate::indexer::languages::CodeLanguage;
 use crate::indexer::markdown::{DocSectionChunk, ExtractedSymbol};
 use crate::indexer::parser::{is_non_doc_comment_line, parse_file_content, ConfigFormat, IndexedFileType};
-use crate::security::{is_denied_path, to_index_path, validate_path};
+use crate::security::{
+    escape_sql_like, is_denied_relative_to, normalize_abs_key, to_index_path, validate_path,
+};
 use anyhow::{bail, Context, Result};
 use globset::GlobBuilder;
 use ignore::WalkBuilder;
@@ -28,14 +30,16 @@ pub struct IndexStats {
     pub symbol_refs: usize,
     pub md_headings: usize,
     pub doc_sections: usize,
-    pub total_raw_bytes: usize,
     pub elapsed_ms: u128,
 }
 
 /// Skip files larger than 2 MB to avoid bloating SQLite with massive generated/data dumps.
 pub const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Cap total indexed files per scan so sprawling non-project directories can never exhaust disk/RAM.
+pub const MAX_INDEX_FILES: usize = 15_000;
 
-/// Returns `true` if `path` is `$HOME` or a filesystem root (`/`) so `lee` never scans an entire home/system tree.
+/// Returns `true` if `path` is `$HOME`, `$HOME/.config`, or a filesystem root (`/`)
+/// so `lee` never scans an entire home/config/system tree (specific subdirs like `~/.config/omarchy` are allowed).
 pub fn is_unsafe_workspace_root(path: &Path) -> bool {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if canonical.parent().is_none() {
@@ -44,6 +48,12 @@ pub fn is_unsafe_workspace_root(path: &Path) -> bool {
     if let Some(home) = dirs::home_dir() {
         let canon_home = fs::canonicalize(&home).unwrap_or(home);
         if canonical == canon_home {
+            return true;
+        }
+    }
+    if let Some(cfg) = dirs::config_dir() {
+        let canon_cfg = fs::canonicalize(&cfg).unwrap_or(cfg);
+        if canonical == canon_cfg {
             return true;
         }
     }
@@ -86,6 +96,17 @@ fn should_skip_dir(name: &str) -> bool {
             | ".idea"
             | ".vscode"
             | "vendor"
+            | "Cache"
+            | "Code Cache"
+            | "GPUCache"
+            | "CachedData"
+            | "IndexedDB"
+            | "Local Storage"
+            | "chromium"
+            | "google-chrome"
+            | "BraveSoftware"
+            | "discord"
+            | "Slack"
     )
 }
 
@@ -107,7 +128,8 @@ pub fn collect_workspace_files(scan_root: &Path, extra_sources: &[PathBuf]) -> V
 
     for root in roots {
         if root.is_file() {
-            if !is_denied_path(&root)
+            let base = root.parent().unwrap_or(Path::new("/"));
+            if !is_denied_relative_to(base, &root)
                 && IndexedFileType::classify(&root).is_some()
                 && is_within_index_size_limit(&root)
             {
@@ -115,37 +137,40 @@ pub fn collect_workspace_files(scan_root: &Path, extra_sources: &[PathBuf]) -> V
             }
             continue;
         }
+        let filter_root = root.clone();
         let walker = WalkBuilder::new(&root)
             .hidden(false)
             .git_ignore(true)
             .git_global(false)
             .git_exclude(true)
-            .filter_entry(|entry| {
-                if let Some(name) = entry.file_name().to_str() {
-                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                        && should_skip_dir(name)
-                    {
-                        return false;
-                    }
+            .filter_entry(move |entry| {
+                if let Some(name) = entry.file_name().to_str()
+                    && entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                    && should_skip_dir(name)
+                {
+                    return false;
                 }
-                !is_denied_path(entry.path())
+                !is_denied_relative_to(&filter_root, entry.path())
             })
             .build_parallel();
 
         walker.run(|| {
             let found_ref = &found;
+            let root_ref = &root;
             Box::new(move |res| {
-                if let Ok(entry) = res {
-                    if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                        let p = entry.into_path();
-                        if !is_denied_path(&p)
-                            && IndexedFileType::classify(&p).is_some()
-                            && is_within_index_size_limit(&p)
-                        {
-                            if let Ok(mut guard) = found_ref.lock() {
-                                guard.push(p);
-                            }
+                if let Ok(entry) = res
+                    && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                {
+                    let p = entry.into_path();
+                    if !is_denied_relative_to(root_ref, &p)
+                        && IndexedFileType::classify(&p).is_some()
+                        && is_within_index_size_limit(&p)
+                        && let Ok(mut guard) = found_ref.lock()
+                    {
+                        if guard.len() >= MAX_INDEX_FILES {
+                            return ignore::WalkState::Quit;
                         }
+                        guard.push(p);
                     }
                 }
                 ignore::WalkState::Continue
@@ -159,12 +184,58 @@ pub fn collect_workspace_files(scan_root: &Path, extra_sources: &[PathBuf]) -> V
     list
 }
 
-/// Removes all indexed files, symbols, and doc sections belonging to a removed external source path.
-pub fn purge_source_from_db(conn: &Connection, source_path: &Path) -> Result<usize> {
-    let prefix = source_path.to_string_lossy().replace('\\', "/");
-    let like_pat = format!("{}/%", prefix.trim_end_matches('/'));
+fn collect_grep_files_from_root(root: &Path, out: &mut Vec<PathBuf>) {
+    if root.is_file() {
+        let base = root.parent().unwrap_or(Path::new("/"));
+        if !is_denied_relative_to(base, root) && is_within_index_size_limit(root) {
+            out.push(root.to_path_buf());
+        }
+        return;
+    }
+    let filter_root = root.to_path_buf();
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .filter_entry(move |entry| {
+            if let Some(name) = entry.file_name().to_str()
+                && entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && should_skip_dir(name)
+            {
+                return false;
+            }
+            !is_denied_relative_to(&filter_root, entry.path())
+        })
+        .build();
+
+    for entry in walker.flatten() {
+        if out.len() >= MAX_INDEX_FILES {
+            break;
+        }
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            let p = entry.into_path();
+            if !is_denied_relative_to(root, &p) && is_within_index_size_limit(&p) {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Removes all indexed files, symbols, and doc sections belonging to a removed doc source path.
+pub fn purge_source_from_db(
+    conn: &Connection,
+    project_root: Option<&Path>,
+    source_path: &Path,
+) -> Result<usize> {
+    let prefix = match project_root {
+        Some(root) => to_index_path(root, source_path),
+        None => normalize_abs_key(source_path),
+    };
+    let escaped = escape_sql_like(prefix.trim_end_matches('/'));
+    let like_pat = format!("{escaped}/%");
     let deleted = conn.execute(
-        "DELETE FROM file_hashes WHERE file_path = ?1 OR file_path LIKE ?2",
+        "DELETE FROM file_hashes WHERE file_path = ?1 OR file_path LIKE ?2 ESCAPE '\\'",
         params![prefix, like_pat],
     )?;
     Ok(deleted)
@@ -210,7 +281,7 @@ fn attach_full_code_doc_section(
     }
 }
 
-type ParallelParseRow = (String, usize, bool, Option<(String, parser::ParsedFileResult)>);
+type ParallelParseRow = (String, bool, Option<(String, parser::ParsedFileResult)>);
 
 /// Reads, hashes (`blake3`), and parses uncached files across CPU cores using `std::thread::scope`.
 fn parse_files_parallel(
@@ -237,7 +308,6 @@ fn parse_files_parallel(
                         let Ok(raw_content) = fs::read_to_string(file_path) else {
                             continue;
                         };
-                        let raw_len = raw_content.len();
                         let raw_hash =
                             blake3::hash(raw_content.as_bytes()).to_hex().to_string();
                         let new_hash = format!("{raw_hash}{expected_suffix}");
@@ -245,7 +315,7 @@ fn parse_files_parallel(
                         if existing_hashes.get(index_key).map(|h| h.as_str())
                             == Some(new_hash.as_str())
                         {
-                            out.push((index_key.clone(), raw_len, true, None));
+                            out.push((index_key.clone(), true, None));
                             continue;
                         }
 
@@ -253,14 +323,9 @@ fn parse_files_parallel(
                             if *is_doc_source {
                                 attach_full_code_doc_section(file_path, &raw_content, &mut parsed);
                             }
-                            out.push((
-                                index_key.clone(),
-                                raw_len,
-                                false,
-                                Some((new_hash, parsed)),
-                            ));
+                            out.push((index_key.clone(), false, Some((new_hash, parsed))));
                         } else {
-                            out.push((index_key.clone(), raw_len, false, None));
+                            out.push((index_key.clone(), false, None));
                         }
                     }
                     out
@@ -276,101 +341,69 @@ fn parse_files_parallel(
     batches.into_iter().flatten().collect()
 }
 
-/// Scans and lazily indexes all supported code and Markdown files in `subpath` + workspace docs into `local_db`.
-/// Global docs are indexed once in `~/.config/lee/global.db` via `index_global_docs` to avoid per-repo duplication.
-pub fn index_workspace(
+fn normalize_subpath(subpath: Option<&str>) -> Option<&str> {
+    let sp = subpath?.trim();
+    if sp.is_empty() || sp == "." || sp == "./" {
+        None
+    } else {
+        Some(sp)
+    }
+}
+
+fn load_existing_db_map(conn: &Connection) -> Result<HashMap<String, (String, i64)>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT file_path, blake3_hash, last_indexed FROM file_hashes")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, String>(1)?, r.get::<_, i64>(2)?),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+fn sync_files_into_db(
     conn: &mut Connection,
-    paths: &AppPaths,
-    subpath: Option<&str>,
+    items: Vec<(PathBuf, String, bool)>,
+    prune_missing: bool,
 ) -> Result<IndexStats> {
     let start_instant = Instant::now();
-    let ws_docs = paths.workspace_doc_paths();
-    let all_docs = paths.all_doc_paths();
+    let existing_db_map = load_existing_db_map(conn)?;
 
-    let scan_root = match subpath {
-        Some(sp) if !sp.is_empty() && sp != "." => {
-            validate_path(&paths.project_root, &all_docs, Path::new(sp))?
-        }
-        _ => {
-            if is_unsafe_workspace_root(&paths.project_root) {
-                bail!(
-                    "Refusing to index unsafe workspace root '{}' (HOME or filesystem root). Run `lee` inside a project directory.",
-                    paths.project_root.display()
-                );
-            }
-            paths.project_root.clone()
-        }
-    };
-
-    let include_sources = subpath.is_none() || subpath == Some(".");
-    let extra_sources = if include_sources {
-        ws_docs.as_slice()
-    } else {
-        &[]
-    };
-
-    let files = collect_workspace_files(&scan_root, extra_sources);
     let mut stats = IndexStats::default();
-    let mut seen_keys: HashSet<String> = HashSet::with_capacity(files.len());
-
-    // Preload all existing file hashes and timestamps without opening a write transaction
-    let existing_db_map: HashMap<String, (String, i64, usize)> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT file_path, blake3_hash, last_indexed, line_count FROM file_hashes",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    (
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3).unwrap_or(1) as usize,
-                    ),
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        rows
-    };
-
+    let mut seen_keys: HashSet<String> = HashSet::with_capacity(items.len());
     let mut to_check: Vec<(PathBuf, String, bool, &'static str)> = Vec::new();
 
-    for file_path in &files {
-        let index_key = to_index_path(&paths.project_root, file_path);
+    for (file_path, index_key, is_doc_source) in items {
         seen_keys.insert(index_key.clone());
-
-        let is_doc_source = is_under_doc_paths(file_path, &ws_docs);
         let expected_suffix =
-            expected_hash_suffix(IndexedFileType::classify(file_path), is_doc_source);
+            expected_hash_suffix(IndexedFileType::classify(&file_path), is_doc_source);
 
-        if let Some((old_hash, last_idx, line_cnt)) = existing_db_map.get(&index_key)
+        if let Some((old_hash, last_idx)) = existing_db_map.get(&index_key)
             && (expected_suffix.is_empty() || old_hash.ends_with(expected_suffix))
-            && let Ok(meta) = fs::metadata(file_path)
+            && let Ok(meta) = fs::metadata(&file_path)
             && let Ok(mtime) = meta.modified()
             && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
             && (dur.as_secs() as i64) < *last_idx
         {
             stats.files_scanned += 1;
             stats.files_cached += 1;
-            stats.total_raw_bytes += (meta.len() as usize).max(line_cnt * 40);
             continue;
         }
-
-        to_check.push((file_path.clone(), index_key, is_doc_source, expected_suffix));
+        to_check.push((file_path, index_key, is_doc_source, expected_suffix));
     }
 
     let mut to_upsert: Vec<(String, String, parser::ParsedFileResult)> = Vec::new();
     if !to_check.is_empty() {
         let existing_hashes: HashMap<String, String> = existing_db_map
             .iter()
-            .map(|(k, (h, _, _))| (k.clone(), h.clone()))
+            .map(|(k, (h, _))| (k.clone(), h.clone()))
             .collect();
-        for (index_key, raw_len, is_cached, parsed_opt) in
-            parse_files_parallel(&to_check, &existing_hashes)
-        {
+        for (index_key, is_cached, parsed_opt) in parse_files_parallel(&to_check, &existing_hashes) {
             stats.files_scanned += 1;
-            stats.total_raw_bytes += raw_len;
             if is_cached {
                 stats.files_cached += 1;
             } else if let Some((new_hash, parsed)) = parsed_opt {
@@ -380,7 +413,7 @@ pub fn index_workspace(
         }
     }
 
-    let to_delete: Vec<&String> = if include_sources {
+    let to_delete: Vec<&String> = if prune_missing {
         existing_db_map
             .keys()
             .filter(|db_path| !seen_keys.contains(*db_path))
@@ -389,7 +422,6 @@ pub fn index_workspace(
         Vec::new()
     };
 
-    // Only open a SQLite write transaction when files actually changed or were deleted
     if !to_upsert.is_empty() || !to_delete.is_empty() {
         let tx = conn.transaction()?;
         for (index_key, new_hash, parsed) in &to_upsert {
@@ -404,7 +436,6 @@ pub fn index_workspace(
         tx.commit()?;
     }
 
-    // Populate total counts from DB
     stats.code_symbols = conn
         .query_row(
             "SELECT COUNT(*) FROM symbols WHERE kind != 'md_heading'",
@@ -434,9 +465,52 @@ pub fn index_workspace(
     Ok(stats)
 }
 
+/// Scans and lazily indexes all supported code and Markdown files in `subpath` + workspace docs into `local_db`.
+/// Global docs are indexed once in `~/.config/lee/global.db` via `index_global_docs` to avoid per-repo duplication.
+pub fn index_workspace(
+    conn: &mut Connection,
+    paths: &AppPaths,
+    subpath: Option<&str>,
+) -> Result<IndexStats> {
+    let ws_docs = paths.workspace_doc_paths();
+    let all_docs = paths.all_doc_paths();
+    let norm_subpath = normalize_subpath(subpath);
+
+    let scan_root = match norm_subpath {
+        Some(sp) => validate_path(&paths.project_root, &all_docs, Path::new(sp))?,
+        None => {
+            if is_unsafe_workspace_root(&paths.project_root) {
+                bail!(
+                    "Refusing to index unsafe workspace root '{}' (HOME or filesystem root). Run `lee` inside a project directory.",
+                    paths.project_root.display()
+                );
+            }
+            paths.project_root.clone()
+        }
+    };
+
+    let include_sources = norm_subpath.is_none();
+    let extra_sources = if include_sources {
+        ws_docs.as_slice()
+    } else {
+        &[]
+    };
+
+    let files = collect_workspace_files(&scan_root, extra_sources);
+    let items: Vec<(PathBuf, String, bool)> = files
+        .into_iter()
+        .map(|fp| {
+            let index_key = to_index_path(&paths.project_root, &fp);
+            let is_doc_source = is_under_doc_paths(&fp, &ws_docs);
+            (fp, index_key, is_doc_source)
+        })
+        .collect();
+
+    sync_files_into_db(conn, items, include_sources)
+}
+
 /// Indexes all registered global docs once into `~/.config/lee/global.db` (shared across all workspaces).
 pub fn index_global_docs(paths: &AppPaths) -> Result<IndexStats> {
-    let start_instant = Instant::now();
     let global_docs = paths.global_doc_paths();
     if global_docs.is_empty() && !paths.global_db.exists() {
         return Ok(IndexStats::default());
@@ -450,111 +524,15 @@ pub fn index_global_docs(paths: &AppPaths) -> Result<IndexStats> {
         Vec::new()
     };
 
-    let mut stats = IndexStats::default();
-    let mut seen_keys: HashSet<String> = HashSet::with_capacity(files.len());
-
-    let existing_db_map: HashMap<String, (String, i64, usize)> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT file_path, blake3_hash, last_indexed, line_count FROM file_hashes",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    (
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3).unwrap_or(1) as usize,
-                    ),
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        rows
-    };
-
-    let mut to_check: Vec<(PathBuf, String, bool, &'static str)> = Vec::new();
-    for file_path in &files {
-        let index_key = file_path.to_string_lossy().to_string();
-        seen_keys.insert(index_key.clone());
-
-        let expected_suffix = expected_hash_suffix(IndexedFileType::classify(file_path), true);
-        if let Some((old_hash, last_idx, line_cnt)) = existing_db_map.get(&index_key)
-            && (expected_suffix.is_empty() || old_hash.ends_with(expected_suffix))
-            && let Ok(meta) = fs::metadata(file_path)
-            && let Ok(mtime) = meta.modified()
-            && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
-            && (dur.as_secs() as i64) < *last_idx
-        {
-            stats.files_scanned += 1;
-            stats.files_cached += 1;
-            stats.total_raw_bytes += (meta.len() as usize).max(line_cnt * 40);
-            continue;
-        }
-        to_check.push((file_path.clone(), index_key, true, expected_suffix));
-    }
-
-    let mut to_upsert: Vec<(String, String, parser::ParsedFileResult)> = Vec::new();
-    if !to_check.is_empty() {
-        let existing_hashes: HashMap<String, String> = existing_db_map
-            .iter()
-            .map(|(k, (h, _, _))| (k.clone(), h.clone()))
-            .collect();
-        for (index_key, raw_len, is_cached, parsed_opt) in
-            parse_files_parallel(&to_check, &existing_hashes)
-        {
-            stats.files_scanned += 1;
-            stats.total_raw_bytes += raw_len;
-            if is_cached {
-                stats.files_cached += 1;
-            } else if let Some((new_hash, parsed)) = parsed_opt {
-                stats.files_reindexed += 1;
-                to_upsert.push((index_key, new_hash, parsed));
-            }
-        }
-    }
-
-    let to_delete: Vec<&String> = existing_db_map
-        .keys()
-        .filter(|db_path| !seen_keys.contains(*db_path))
+    let items: Vec<(PathBuf, String, bool)> = files
+        .into_iter()
+        .map(|fp| {
+            let index_key = normalize_abs_key(&fp);
+            (fp, index_key, true)
+        })
         .collect();
 
-    if !to_upsert.is_empty() || !to_delete.is_empty() {
-        let tx = conn.transaction()?;
-        for (index_key, new_hash, parsed) in &to_upsert {
-            upsert_parsed_file(&tx, index_key, new_hash, parsed)?;
-        }
-        if !to_delete.is_empty() {
-            let mut del_stmt = tx.prepare_cached("DELETE FROM file_hashes WHERE file_path = ?1")?;
-            for db_path in &to_delete {
-                del_stmt.execute(params![db_path])?;
-            }
-        }
-        tx.commit()?;
-    }
-
-    stats.code_symbols = conn
-        .query_row(
-            "SELECT COUNT(*) FROM symbols WHERE kind != 'md_heading'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize;
-    stats.md_headings = conn
-        .query_row(
-            "SELECT COUNT(*) FROM symbols WHERE kind = 'md_heading'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0) as usize;
-    stats.doc_sections = conn
-        .query_row("SELECT COUNT(*) FROM doc_sections_meta", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .unwrap_or(0) as usize;
-    stats.elapsed_ms = start_instant.elapsed().as_millis();
-
-    Ok(stats)
+    sync_files_into_db(&mut conn, items, true)
 }
 
 #[derive(Debug, Clone)]
@@ -567,7 +545,6 @@ pub struct DocUpdateReport {
     pub added: usize,
     pub updated: usize,
     pub removed: usize,
-    pub unchanged: usize,
 }
 
 impl DocUpdateReport {
@@ -587,20 +564,8 @@ fn update_docs_in_conn(
     docs: &[(DocScope, DocEntry)],
     reports: &mut Vec<DocUpdateReport>,
 ) -> Result<()> {
-    let existing_db_map: HashMap<String, (String, i64)> = {
-        let mut stmt = conn.prepare("SELECT file_path, blake3_hash, last_indexed FROM file_hashes")?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    (r.get::<_, String>(1)?, r.get::<_, i64>(2)?),
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        rows
-    };
-    let existing_hashes: HashMap<String, String> = existing_db_map
+    let mut existing_db_map = load_existing_db_map(conn)?;
+    let mut existing_hashes: HashMap<String, String> = existing_db_map
         .iter()
         .map(|(k, (h, _))| (k.clone(), h.clone()))
         .collect();
@@ -616,24 +581,22 @@ fn update_docs_in_conn(
                 added: 0,
                 updated: 0,
                 removed: 0,
-                unchanged: 0,
             });
             continue;
         }
 
         let doc_key = match project_root {
             Some(root) => to_index_path(root, &entry.path),
-            None => entry.path.to_string_lossy().to_string(),
+            None => normalize_abs_key(&entry.path),
         };
         let files = collect_workspace_files(&entry.path, &[]);
         let mut seen_keys: HashSet<String> = HashSet::with_capacity(files.len());
         let mut to_check: Vec<(PathBuf, String, bool, &'static str)> = Vec::new();
-        let mut unchanged = 0usize;
 
         for file_path in &files {
             let index_key = match project_root {
                 Some(root) => to_index_path(root, file_path),
-                None => file_path.to_string_lossy().to_string(),
+                None => normalize_abs_key(file_path),
             };
             seen_keys.insert(index_key.clone());
 
@@ -645,7 +608,6 @@ fn update_docs_in_conn(
                 && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
                 && (dur.as_secs() as i64) < *last_idx
             {
-                unchanged += 1;
                 continue;
             }
             to_check.push((file_path.clone(), index_key, true, expected_suffix));
@@ -655,12 +617,10 @@ fn update_docs_in_conn(
         let mut added = 0usize;
         let mut updated = 0usize;
 
-        for (index_key, _raw_len, is_cached, parsed_opt) in
-            parse_files_parallel(&to_check, &existing_hashes)
-        {
-            if is_cached {
-                unchanged += 1;
-            } else if let Some((new_hash, parsed)) = parsed_opt {
+        for (index_key, is_cached, parsed_opt) in parse_files_parallel(&to_check, &existing_hashes) {
+            if !is_cached
+                && let Some((new_hash, parsed)) = parsed_opt
+            {
                 if existing_db_map.contains_key(&index_key) {
                     updated += 1;
                 } else {
@@ -670,14 +630,16 @@ fn update_docs_in_conn(
             }
         }
 
-        let to_remove: Vec<&String> = existing_db_map
+        let to_remove: Vec<String> = existing_db_map
             .keys()
             .filter(|db_path| path_belongs_to_doc(db_path, &doc_key) && !seen_keys.contains(*db_path))
+            .cloned()
             .collect();
         let removed = to_remove.len();
 
         if !to_upsert.is_empty() || !to_remove.is_empty() {
             let tx = conn.transaction()?;
+            let ts = now_unix();
             for (index_key, new_hash, parsed) in &to_upsert {
                 upsert_parsed_file(&tx, index_key, new_hash, parsed)?;
             }
@@ -688,6 +650,15 @@ fn update_docs_in_conn(
                 }
             }
             tx.commit()?;
+
+            for (index_key, new_hash, _) in &to_upsert {
+                existing_db_map.insert(index_key.clone(), (new_hash.clone(), ts));
+                existing_hashes.insert(index_key.clone(), new_hash.clone());
+            }
+            for db_path in &to_remove {
+                existing_db_map.remove(db_path);
+                existing_hashes.remove(db_path);
+            }
         }
 
         reports.push(DocUpdateReport {
@@ -699,7 +670,6 @@ fn update_docs_in_conn(
             added,
             updated,
             removed,
-            unchanged,
         });
     }
     Ok(())
@@ -811,39 +781,51 @@ fn upsert_parsed_file(
     Ok(())
 }
 
+fn is_under_root(root: &Path, candidate: &Path) -> bool {
+    let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canon_cand = fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    canon_cand == canon_root || canon_cand.starts_with(&canon_root)
+}
+
 /// Lazily indexes a single file if its `blake3` hash is missing or changed.
-/// Returns `(index_key, raw_content, raw_bytes)`.
+/// Routes global-only docs to `global_db` so `local_db` stays clean.
+/// Returns `(index_key, raw_content, in_global_db)`.
 pub fn ensure_single_file_indexed(
     conn: &Connection,
     paths: &AppPaths,
     file_arg: &str,
-) -> Result<(String, String, usize)> {
-    let mut allowed = paths.all_doc_paths();
-    if let Ok(mut stmt) = conn.prepare("SELECT file_path FROM file_hashes WHERE file_path LIKE '/%'")
-    {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for fp in rows.flatten() {
-                if let Some(parent) = Path::new(&fp).parent() {
-                    let pb = parent.to_path_buf();
-                    if !allowed.contains(&pb) {
-                        allowed.push(pb);
-                    }
-                }
-            }
-        }
-    }
+) -> Result<(String, String, bool)> {
+    let ws_docs = paths.workspace_doc_paths();
+    let global_docs = paths.global_doc_paths();
+    let allowed = paths.all_doc_paths();
 
-    let resolved = resolve_file_with_sources(conn, &paths.project_root, &allowed, file_arg)?;
+    let resolved = resolve_file_with_sources(conn, paths, &allowed, file_arg)?;
     let raw_content = fs::read_to_string(&resolved)
         .with_context(|| format!("Failed to read file '{}'", resolved.display()))?;
-    let raw_bytes = raw_content.len();
-    let index_key = to_index_path(&paths.project_root, &resolved);
-    let is_doc_source = is_under_doc_paths(&resolved, &paths.all_doc_paths());
+
+    let is_global_only = !is_under_root(&paths.project_root, &resolved)
+        && !is_under_doc_paths(&resolved, &ws_docs)
+        && is_under_doc_paths(&resolved, &global_docs);
+    let is_doc_source = is_global_only || is_under_doc_paths(&resolved, &ws_docs);
+    let index_key = if is_global_only {
+        normalize_abs_key(&resolved)
+    } else {
+        to_index_path(&paths.project_root, &resolved)
+    };
+
     let raw_hash = blake3::hash(raw_content.as_bytes()).to_hex().to_string();
     let expected_suffix = expected_hash_suffix(IndexedFileType::classify(&resolved), is_doc_source);
     let new_hash = format!("{raw_hash}{expected_suffix}");
 
-    let existing_hash: Option<String> = conn
+    let gconn_holder = if is_global_only {
+        paths.ensure_global_dirs()?;
+        Some(init_connection(&paths.global_db)?)
+    } else {
+        None
+    };
+    let target_conn = gconn_holder.as_ref().unwrap_or(conn);
+
+    let existing_hash: Option<String> = target_conn
         .query_row(
             "SELECT blake3_hash FROM file_hashes WHERE file_path = ?1",
             params![&index_key],
@@ -851,53 +833,68 @@ pub fn ensure_single_file_indexed(
         )
         .optional()?;
 
-    if existing_hash.as_deref() != Some(new_hash.as_str()) {
-        if let Some(mut parsed) = parse_file_content(&resolved, &raw_content)? {
-            if is_doc_source {
-                attach_full_code_doc_section(&resolved, &raw_content, &mut parsed);
-            }
-            upsert_parsed_file(conn, &index_key, &new_hash, &parsed)?;
+    if existing_hash.as_deref() != Some(new_hash.as_str())
+        && let Some(mut parsed) = parse_file_content(&resolved, &raw_content)?
+    {
+        if is_doc_source {
+            attach_full_code_doc_section(&resolved, &raw_content, &mut parsed);
         }
+        upsert_parsed_file(target_conn, &index_key, &new_hash, &parsed)?;
     }
 
-    Ok((index_key, raw_content, raw_bytes))
+    Ok((index_key, raw_content, is_global_only))
+}
+
+fn lookup_file_in_db(
+    conn: &Connection,
+    project_root: &Path,
+    sources: &[PathBuf],
+    clean_arg: &str,
+) -> Option<PathBuf> {
+    let like_pat = format!("%/{}", escape_sql_like(clean_arg));
+    let matched_fp = conn
+        .query_row(
+            "SELECT file_path FROM file_hashes
+             WHERE file_path = ?1 OR file_path LIKE ?2 ESCAPE '\\'
+             ORDER BY LENGTH(file_path) ASC LIMIT 1",
+            params![clean_arg, like_pat],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()??;
+    let valid = validate_path(project_root, sources, Path::new(&matched_fp)).ok()?;
+    valid.exists().then_some(valid)
 }
 
 fn resolve_file_with_sources(
     conn: &Connection,
-    project_root: &Path,
+    paths: &AppPaths,
     sources: &[PathBuf],
     file_arg: &str,
 ) -> Result<PathBuf> {
     let candidate = Path::new(file_arg);
-    if let Ok(valid) = validate_path(project_root, sources, candidate) {
-        if valid.exists() {
-            return Ok(valid);
-        }
+    if let Ok(valid) = validate_path(&paths.project_root, sources, candidate)
+        && valid.exists()
+    {
+        return Ok(valid);
     }
     for src in sources {
         let joined = src.join(candidate);
         if joined.exists() {
-            return validate_path(project_root, sources, &joined);
+            return validate_path(&paths.project_root, sources, &joined);
         }
     }
     let clean_arg = file_arg.trim_start_matches("./").replace('\\', "/");
-    if let Ok(Some(matched_fp)) = conn
-        .query_row(
-            "SELECT file_path FROM file_hashes WHERE file_path = ?1 OR file_path LIKE ?2 ORDER BY LENGTH(file_path) ASC LIMIT 1",
-            params![&clean_arg, format!("%/{clean_arg}")],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-    {
-        let matched_path = Path::new(&matched_fp);
-        if let Ok(valid) = validate_path(project_root, sources, matched_path) {
-            if valid.exists() {
-                return Ok(valid);
-            }
-        }
+    if let Some(valid) = lookup_file_in_db(conn, &paths.project_root, sources, &clean_arg) {
+        return Ok(valid);
     }
-    validate_path(project_root, sources, candidate)
+    if paths.global_db.exists()
+        && let Ok(gconn) = init_connection(&paths.global_db)
+        && let Some(valid) = lookup_file_in_db(&gconn, &paths.project_root, sources, &clean_arg)
+    {
+        return Ok(valid);
+    }
+    validate_path(&paths.project_root, sources, candidate)
 }
 
 fn map_file_priority(path: &str) -> u8 {
@@ -1064,14 +1061,17 @@ fn fuzzy_symbol_score(query: &str, candidate: &str) -> f64 {
     }
 }
 
+type SymbolMatch = (String, String, String, i64, i64);
+type FuzzySymbolMatch = (String, String, String, String, i64, i64, f64);
+
 /// Finds top fuzzy-matched symbols from `symbols` when exact / SQL `LIKE` lookup returns no match.
 fn fuzzy_find_symbols(
     conn: &Connection,
     file_filter: Option<&str>,
     clean_query: &str,
     limit: usize,
-) -> Vec<(String, String, String, String, i64, i64, f64)> {
-    let mut candidates: Vec<(String, String, String, String, i64, i64, f64)> = Vec::new();
+) -> Vec<FuzzySymbolMatch> {
+    let mut candidates: Vec<FuzzySymbolMatch> = Vec::new();
     let sql = if file_filter.is_some() {
         "SELECT file_path, kind, name, signature, start_line, end_line FROM symbols WHERE file_path = ?1"
     } else {
@@ -1118,17 +1118,18 @@ pub fn build_project_map(
     paths: &AppPaths,
     subpath: Option<&str>,
     max_tokens: usize,
-) -> Result<(String, usize)> {
-    let stats = index_workspace(conn, paths, subpath)?;
+) -> Result<String> {
+    let norm_subpath = normalize_subpath(subpath);
+    index_workspace(conn, paths, norm_subpath)?;
     let max_bytes = max_tokens.saturating_mul(4).max(400);
 
-    let prefix_filter = match subpath {
-        Some(sp) if !sp.is_empty() && sp != "." => {
+    let prefix_filter = match norm_subpath {
+        Some(sp) => {
             let allowed = paths.all_doc_paths();
             let resolved = validate_path(&paths.project_root, &allowed, Path::new(sp))?;
             Some(to_index_path(&paths.project_root, &resolved))
         }
-        _ => None,
+        None => None,
     };
 
     let mut stmt = conn.prepare(
@@ -1148,7 +1149,8 @@ pub fn build_project_map(
     while let Some(row) = rows.next()? {
         let file_path: String = row.get(0)?;
         if let Some(ref pref) = prefix_filter {
-            if !file_path.starts_with(pref) {
+            let p = pref.trim_end_matches('/');
+            if file_path != p && !file_path.starts_with(&format!("{p}/")) {
                 continue;
             }
         }
@@ -1318,8 +1320,7 @@ pub fn build_project_map(
         }
     }
 
-    let raw_bytes = stats.total_raw_bytes.max(out.len());
-    Ok((out, raw_bytes))
+    Ok(out)
 }
 
 /// Tool 2: `outline` — returns AST symbols (code), Heading TOC (Markdown), or key/section TOC (YAML/TOML/JSON).
@@ -1330,10 +1331,16 @@ pub fn build_outline(
     file_arg: &str,
     max_tokens: usize,
     include_tests: bool,
-) -> Result<(String, usize)> {
-    let (index_key, _content, raw_bytes) = ensure_single_file_indexed(conn, paths, file_arg)?;
+) -> Result<String> {
+    let (index_key, _content, is_global) = ensure_single_file_indexed(conn, paths, file_arg)?;
+    let gconn_holder = if is_global {
+        Some(init_connection(&paths.global_db)?)
+    } else {
+        None
+    };
+    let sym_conn = gconn_holder.as_ref().unwrap_or(conn);
 
-    let mut stmt = conn.prepare(
+    let mut stmt = sym_conn.prepare(
         "SELECT name, kind, signature, start_line, end_line, parent_name
          FROM symbols
          WHERE file_path = ?1
@@ -1415,7 +1422,56 @@ pub fn build_outline(
         }
     }
 
-    Ok((out, raw_bytes))
+    Ok(out)
+}
+
+fn parse_symbol_query(sym_query: &str) -> (Option<&str>, &str) {
+    let raw_clean = sym_query.trim().trim_start_matches('#').trim();
+    if let Some((p, s)) = raw_clean.rsplit_once("::") {
+        (Some(p.rsplit("::").next().unwrap_or(p).trim()), s.trim())
+    } else if !raw_clean.contains(' ')
+        && let Some((p, s)) = raw_clean.rsplit_once('.')
+    {
+        (Some(p.trim()), s.trim())
+    } else {
+        (None, raw_clean)
+    }
+}
+
+fn find_workspace_symbol_matches(
+    conn: &Connection,
+    sym_query: &str,
+    clean_query: &str,
+    parent_hint: Option<&str>,
+) -> Result<Vec<SymbolMatch>> {
+    let like_pat = format!("%{}%", escape_sql_like(clean_query));
+    let mut stmt = conn.prepare(
+        "SELECT file_path, kind, name, start_line, end_line
+         FROM symbols
+         WHERE name = ?1 OR signature = ?2 OR LOWER(name) LIKE LOWER(?3) ESCAPE '\\'
+         ORDER BY
+           CASE WHEN ?4 IS NOT NULL AND parent_name = ?4 THEN 0 ELSE 1 END,
+           CASE WHEN name = ?1 THEN 0 WHEN LOWER(name) = LOWER(?1) THEN 1 ELSE 2 END,
+           CASE WHEN file_path LIKE '/%' THEN 1 ELSE 0 END ASC,
+           CASE WHEN parent_name = 'tests' THEN 1 ELSE 0 END ASC,
+           LENGTH(name) ASC,
+           file_path ASC,
+           start_line ASC
+         LIMIT 6",
+    )?;
+    let mut matches: Vec<SymbolMatch> = stmt
+        .query_map(
+            params![clean_query, sym_query.trim(), like_pat, parent_hint],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?
+        .filter_map(|r| r.ok())
+        .collect();
+    if matches.is_empty() {
+        for (fp, kind, name, _sig, st, en, _sc) in fuzzy_find_symbols(conn, None, clean_query, 4) {
+            matches.push((fp, kind, name, st, en));
+        }
+    }
+    Ok(matches)
 }
 
 /// Tool 3: `read_symbol` — reads exact line range for a code symbol/function (across workspace if `file` is omitted),
@@ -1432,54 +1488,121 @@ pub fn read_symbol_range(
     strip_comments: bool,
     signatures_only: bool,
     max_lines: usize,
-) -> Result<(String, usize)> {
+) -> Result<String> {
+    read_symbol_range_inner(
+        conn,
+        paths,
+        file_arg,
+        symbol,
+        start_line,
+        end_line,
+        context_lines,
+        strip_comments,
+        signatures_only,
+        max_lines,
+        true,
+    )
+}
+
+/// Batch variant of `read_symbol_range` that syncs the workspace index at most once across all requested symbols.
+#[allow(clippy::too_many_arguments)]
+pub fn read_symbols_batch(
+    conn: &mut Connection,
+    paths: &AppPaths,
+    file_arg: Option<&str>,
+    symbols: &[String],
+    context_lines: usize,
+    strip_comments: bool,
+    signatures_only: bool,
+    max_lines: usize,
+) -> Result<String> {
+    let cleaned: Vec<&str> = symbols
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        bail!("Provide at least one non-empty symbol name in `symbols`.");
+    }
+    if file_arg.map(|s| s.trim().is_empty()).unwrap_or(true) {
+        let _ = index_workspace(conn, paths, None);
+    }
+
+    let mut sections = Vec::with_capacity(cleaned.len());
+    let mut succeeded = 0usize;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for sym in cleaned {
+        match read_symbol_range_inner(
+            conn,
+            paths,
+            file_arg,
+            Some(sym),
+            None,
+            None,
+            context_lines,
+            strip_comments,
+            signatures_only,
+            max_lines,
+            false,
+        ) {
+            Ok(out) => {
+                succeeded += 1;
+                sections.push(out);
+            }
+            Err(e) => {
+                sections.push(format!("# Error reading `{sym}`: {e}\n"));
+                last_err = Some(e);
+            }
+        }
+    }
+
+    if succeeded == 0 {
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        bail!("None of the requested symbols could be found.");
+    }
+
+    Ok(sections.join("\n"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_symbol_range_inner(
+    conn: &mut Connection,
+    paths: &AppPaths,
+    file_arg: Option<&str>,
+    symbol: Option<&str>,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    context_lines: usize,
+    strip_comments: bool,
+    signatures_only: bool,
+    max_lines: usize,
+    sync_workspace: bool,
+) -> Result<String> {
+    if let Some(sym_raw) = symbol {
+        let (_, clean) = parse_symbol_query(sym_raw);
+        if clean.is_empty() {
+            bail!("Provide a non-empty `symbol` to `read_symbol`");
+        }
+    }
+
     let mut other_matches_note = String::new();
     let resolved_file_owned: String;
     let effective_file_arg = if let Some(fa) = file_arg.filter(|s| !s.trim().is_empty()) {
         fa
     } else if let Some(sym_query) = symbol {
-        let raw_clean = sym_query.trim().trim_start_matches('#').trim();
-        let (parent_hint, clean_query) = if let Some((p, s)) = raw_clean.rsplit_once("::") {
-            (Some(p.rsplit("::").next().unwrap_or(p).trim()), s.trim())
-        } else if !raw_clean.contains(' ')
-            && let Some((p, s)) = raw_clean.rsplit_once('.')
+        let (parent_hint, clean_query) = parse_symbol_query(sym_query);
+        if sync_workspace {
+            let _ = index_workspace(conn, paths, None);
+        }
+        let mut matches = find_workspace_symbol_matches(conn, sym_query, clean_query, parent_hint)?;
+        if matches.is_empty()
+            && paths.global_db.exists()
+            && let Ok(gconn) = init_connection(&paths.global_db)
         {
-            (Some(p.trim()), s.trim())
-        } else {
-            (None, raw_clean)
-        };
-        let find_matches = |c: &Connection| -> Result<Vec<(String, String, String, i64, i64)>> {
-            let mut stmt = c.prepare(
-                "SELECT file_path, kind, name, start_line, end_line
-                 FROM symbols
-                 WHERE name = ?1 OR signature = ?2 OR LOWER(name) LIKE LOWER(?3)
-                 ORDER BY
-                   CASE WHEN ?4 IS NOT NULL AND parent_name = ?4 THEN 0 ELSE 1 END,
-                   CASE WHEN name = ?1 THEN 0 WHEN LOWER(name) = LOWER(?1) THEN 1 ELSE 2 END,
-                   CASE WHEN file_path LIKE '/%' THEN 1 ELSE 0 END ASC,
-                   CASE WHEN parent_name = 'tests' THEN 1 ELSE 0 END ASC,
-                   LENGTH(name) ASC,
-                   file_path ASC,
-                   start_line ASC
-                 LIMIT 6",
-            )?;
-            let rows = stmt
-                .query_map(
-                    params![clean_query, sym_query.trim(), format!("%{clean_query}%"), parent_hint],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(rows)
-        };
-
-        let _ = index_workspace(conn, paths, None);
-        let mut matches = find_matches(conn)?;
-        if matches.is_empty() {
-            for (fp, kind, name, _sig, st, en, _sc) in fuzzy_find_symbols(conn, None, clean_query, 4)
-            {
-                matches.push((fp, kind, name, st, en));
-            }
+            matches = find_workspace_symbol_matches(&gconn, sym_query, clean_query, parent_hint)?;
         }
 
         let Some(first) = matches.first() else {
@@ -1501,46 +1624,39 @@ pub fn read_symbol_range(
         bail!("Provide `file` or `symbol` (e.g. function name) to `read_symbol`");
     };
 
-    let (index_key, raw_content, raw_bytes) =
+    let (index_key, raw_content, is_global) =
         ensure_single_file_indexed(conn, paths, effective_file_arg)?;
+    let gconn_holder = if is_global {
+        Some(init_connection(&paths.global_db)?)
+    } else {
+        None
+    };
+    let sym_conn = gconn_holder.as_ref().unwrap_or(conn);
+
     let lines: Vec<&str> = raw_content.lines().collect();
     let total_lines = lines.len().max(1);
 
     let (target_start, target_end, header_label) = if let Some(sym_query) = symbol {
-        let raw_clean = sym_query.trim().trim_start_matches('#').trim();
-        let (parent_hint, clean_query) = if let Some((p, s)) = raw_clean.rsplit_once("::") {
-            (Some(p.rsplit("::").next().unwrap_or(p).trim()), s.trim())
-        } else if !raw_clean.contains(' ')
-            && let Some((p, s)) = raw_clean.rsplit_once('.')
-        {
-            (Some(p.trim()), s.trim())
-        } else {
-            (None, raw_clean)
-        };
-        let row: Option<(String, String, i64, i64)> = conn
+        let (parent_hint, clean_query) = parse_symbol_query(sym_query);
+        let like_pat = format!("%{}%", escape_sql_like(clean_query));
+        let row: Option<(String, String, i64, i64)> = sym_conn
             .query_row(
                 "SELECT name, signature, start_line, end_line
                  FROM symbols
                  WHERE file_path = ?1
-                   AND (name = ?2 OR signature = ?3 OR LOWER(name) LIKE LOWER(?4) OR LOWER(signature) LIKE LOWER(?4))
+                   AND (name = ?2 OR signature = ?3 OR LOWER(name) LIKE LOWER(?4) ESCAPE '\\' OR LOWER(signature) LIKE LOWER(?4) ESCAPE '\\')
                  ORDER BY
                    CASE WHEN ?5 IS NOT NULL AND parent_name = ?5 THEN 0 ELSE 1 END,
                    CASE WHEN name = ?2 THEN 0 WHEN LOWER(name) = LOWER(?2) THEN 1 ELSE 2 END,
                    start_line ASC
                  LIMIT 1",
-                params![
-                    &index_key,
-                    clean_query,
-                    sym_query.trim(),
-                    format!("%{clean_query}%"),
-                    parent_hint
-                ],
+                params![&index_key, clean_query, sym_query.trim(), like_pat, parent_hint],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
 
         let row = row.or_else(|| {
-            fuzzy_find_symbols(conn, Some(&index_key), clean_query, 1)
+            fuzzy_find_symbols(sym_conn, Some(&index_key), clean_query, 1)
                 .into_iter()
                 .next()
                 .map(|(_fp, _k, name, sig, st, en, _sc)| (name, sig, st, en))
@@ -1561,6 +1677,9 @@ pub fn read_symbol_range(
     } else if let Some(st) = start_line {
         let st_clamped = st.max(1).min(total_lines);
         (st_clamped, total_lines, format!("lines {st_clamped}..{total_lines}"))
+    } else if let Some(en) = end_line {
+        let en_clamped = en.max(1).min(total_lines);
+        (1, en_clamped, format!("lines 1..{en_clamped}"))
     } else {
         (1, total_lines, format!("lines 1..{total_lines}"))
     };
@@ -1568,13 +1687,14 @@ pub fn read_symbol_range(
     // Only pad with context_lines for symbol lookups; explicit line-range reads stay exact
     let effective_context = if symbol.is_some() { context_lines } else { 0 };
     let actual_start = target_start.saturating_sub(effective_context).max(1);
-    let requested_end = (target_end + effective_context).min(total_lines);
+    let requested_end = target_end.saturating_add(effective_context).min(total_lines);
     let max_cap = max_lines.max(20);
-    let actual_end = if signatures_only {
-        requested_end.min(actual_start + max_cap.saturating_mul(4) - 1)
+    let cap_span = if signatures_only {
+        max_cap.saturating_mul(4)
     } else {
-        requested_end.min(actual_start + max_cap - 1)
+        max_cap
     };
+    let actual_end = requested_end.min(actual_start.saturating_add(cap_span).saturating_sub(1));
 
     let file_type = IndexedFileType::classify(Path::new(&index_key));
     let is_code_file = matches!(file_type, Some(IndexedFileType::Code(_)));
@@ -1584,20 +1704,18 @@ pub fn read_symbol_range(
             | Some(IndexedFileType::Code(CodeLanguage::Python))
     );
 
-    // Collect AST function/method spans if `signatures_only` is active on a code file
+    // Collect AST function spans if `signatures_only` is active on a code file
     let fn_spans: Vec<(usize, usize)> = if signatures_only && is_code_file {
-        let mut stmt = conn.prepare(
+        let mut stmt = sym_conn.prepare(
             "SELECT start_line, end_line FROM symbols
-             WHERE file_path = ?1 AND kind IN ('fn', 'method') AND end_line > start_line + 2
+             WHERE file_path = ?1 AND kind = 'fn' AND end_line > start_line + 2
              ORDER BY start_line ASC",
         )?;
-        let rows = stmt
-            .query_map(params![&index_key], |r| {
-                Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        rows
+        stmt.query_map(params![&index_key], |r| {
+            Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
     } else {
         Vec::new()
     };
@@ -1614,7 +1732,7 @@ pub fn read_symbol_range(
         if let Some(&(fn_start, fn_end)) = fn_spans.iter().find(|&&(s, e)| line_no >= s && line_no <= e) {
             if line_no == fn_start {
                 // Output signature header lines until `{` (or `:` in Python), up to 6 lines
-                let sig_limit = (fn_start + 5).min(fn_end).min(actual_end);
+                let sig_limit = fn_start.saturating_add(5).min(fn_end).min(actual_end);
                 let mut header_end = fn_start;
                 for lno in fn_start..=sig_limit {
                     if let Some(lstr) = lines.get(lno - 1) {
@@ -1632,12 +1750,11 @@ pub fn read_symbol_range(
                         header_end + 1,
                         fn_end
                     ));
-                    if !hash_comments {
-                        if let Some(close_line) = lines.get(fn_end - 1) {
-                            if close_line.trim().starts_with('}') {
-                                out.push_str(&format!("{fn_end:>4} | {close_line}\n"));
-                            }
-                        }
+                    if !hash_comments
+                        && let Some(close_line) = lines.get(fn_end - 1)
+                        && close_line.trim().starts_with('}')
+                    {
+                        out.push_str(&format!("{fn_end:>4} | {close_line}\n"));
                     }
                 }
             } else {
@@ -1670,8 +1787,8 @@ pub fn read_symbol_range(
     }
 
     if actual_end < requested_end {
-        let next_start = actual_end + 1;
-        let next_end = (actual_end + max_cap).min(requested_end);
+        let next_start = actual_end.saturating_add(1);
+        let next_end = actual_end.saturating_add(max_cap).min(requested_end);
         out.push_str(&format!(
             "... [paginated at {max_cap} lines; call read_symbol(file=\"{index_key}\", start_line={next_start}, end_line={next_end}) for next slice]\n"
         ));
@@ -1680,7 +1797,7 @@ pub fn read_symbol_range(
         out.push_str(&other_matches_note);
     }
 
-    Ok((out, raw_bytes))
+    Ok(out)
 }
 
 fn clean_match_line(line: &str, max_len: usize, re: &regex::Regex) -> String {
@@ -1727,7 +1844,11 @@ pub fn smart_grep_search(
     whole_word: bool,
     max_per_file: usize,
     max_results: usize,
-) -> Result<(String, usize)> {
+) -> Result<String> {
+    if pattern.is_empty() {
+        bail!("Provide a non-empty search `pattern` to `smart_grep`");
+    }
+
     let raw_pat = if whole_word {
         format!(r"\b(?:{pattern})\b")
     } else {
@@ -1760,9 +1881,8 @@ pub fn smart_grep_search(
     };
 
     let allowed_docs = paths.all_doc_paths();
-    if path_filter.map(|s| s.trim().is_empty()).unwrap_or(true)
-        && is_unsafe_workspace_root(&paths.project_root)
-    {
+    let trimmed_pf = path_filter.map(|s| s.trim()).filter(|s| !s.is_empty());
+    if trimmed_pf.is_none() && is_unsafe_workspace_root(&paths.project_root) {
         bail!(
             "Refusing to run `smart_grep` across unsafe root '{}' (HOME or filesystem root). Pass an explicit `path` or run inside a project directory.",
             paths.project_root.display()
@@ -1772,126 +1892,63 @@ pub fn smart_grep_search(
     let mut local_files = Vec::new();
     let mut ext_files = Vec::new();
 
-    // Determine explicit path roots if `path_filter` is given (supports comma/space-separated paths)
-    let explicit_roots: Vec<PathBuf> = match path_filter {
-        Some(pf) if !pf.trim().is_empty() => {
-            let mut list = Vec::new();
-            for token in pf.split(|c: char| c == ',' || c.is_whitespace()) {
-                let t = token.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                if let Ok(valid) = validate_path(&paths.project_root, &allowed_docs, Path::new(t)) {
-                    if valid.exists() {
-                        list.push(valid);
-                    }
-                }
-            }
-            list
-        }
-        _ => Vec::new(),
-    };
-
-    if !explicit_roots.is_empty() {
-        for root in explicit_roots {
-            if root.is_file() {
-                if !is_denied_path(&root) {
-                    local_files.push(root);
-                }
+    if let Some(pf) = trimmed_pf {
+        let mut explicit_roots = Vec::new();
+        let mut last_err: Option<anyhow::Error> = None;
+        for token in pf.split(|c: char| c == ',' || c.is_whitespace()) {
+            let t = token.trim();
+            if t.is_empty() {
                 continue;
             }
-            let walker = WalkBuilder::new(&root)
-                .hidden(false)
-                .git_ignore(true)
-                .filter_entry(|entry| {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                            && should_skip_dir(name)
-                        {
-                            return false;
-                        }
-                    }
-                    !is_denied_path(entry.path())
-                })
-                .build();
-            for entry in walker.flatten() {
-                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    let p = entry.into_path();
-                    if !is_denied_path(&p) {
-                        local_files.push(p);
-                    }
+            match validate_path(&paths.project_root, &allowed_docs, Path::new(t)) {
+                Ok(valid) if valid.exists() => explicit_roots.push(valid),
+                Ok(valid) => {
+                    last_err = Some(anyhow::anyhow!("Path '{}' does not exist", valid.display()));
+                }
+                Err(e) => {
+                    last_err = Some(e);
                 }
             }
+        }
+        if explicit_roots.is_empty() {
+            if let Some(err) = last_err {
+                return Err(err);
+            }
+            bail!("No valid existing path found for `path` filter '{pf}'.");
+        }
+        for root in explicit_roots {
+            collect_grep_files_from_root(&root, &mut local_files);
         }
         local_files.sort();
         local_files.dedup();
     } else {
-        let walker = WalkBuilder::new(&paths.project_root)
-            .hidden(false)
-            .git_ignore(true)
-            .filter_entry(|entry| {
-                if let Some(name) = entry.file_name().to_str() {
-                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                        && should_skip_dir(name)
-                    {
-                        return false;
-                    }
-                }
-                !is_denied_path(entry.path())
-            })
-            .build();
-
-        for entry in walker.flatten() {
-            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                let p = entry.into_path();
-                if !is_denied_path(&p) {
-                    local_files.push(p);
-                }
-            }
-        }
+        collect_grep_files_from_root(&paths.project_root, &mut local_files);
         local_files.sort();
         local_files.dedup();
 
         for src in &allowed_docs {
-            if !src.exists() {
-                continue;
-            }
-            let walker = WalkBuilder::new(src)
-                .hidden(false)
-                .git_ignore(true)
-                .filter_entry(|entry| {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                            && should_skip_dir(name)
-                        {
-                            return false;
-                        }
-                    }
-                    !is_denied_path(entry.path())
-                })
-                .build();
-
-            for entry in walker.flatten() {
-                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    let p = entry.into_path();
-                    if !is_denied_path(&p) {
-                        ext_files.push(p);
-                    }
-                }
+            if src.exists() {
+                collect_grep_files_from_root(src, &mut ext_files);
             }
         }
         ext_files.sort();
         ext_files.dedup();
     }
 
-    let all_files = local_files.into_iter().chain(ext_files);
+    let mut seen_paths = HashSet::with_capacity(local_files.len() + ext_files.len());
+    let all_files: Vec<PathBuf> = local_files
+        .into_iter()
+        .chain(ext_files)
+        .filter(|p| seen_paths.insert(p.clone()))
+        .collect();
 
     // Group matches by file (RTK-style) with per-file cap
     let mut grouped: Vec<(String, usize, Vec<String>)> = Vec::new();
-    let mut total_matched_file_bytes = 0usize;
     let mut total_matches = 0usize;
     let mut total_shown = 0usize;
     let per_file_cap = max_per_file.max(1);
+    let max_results = max_results.max(1);
+    let mut gconn_cache: Option<Connection> = None;
 
     for file_path in all_files {
         if !files_only && total_shown >= max_results {
@@ -1914,14 +1971,19 @@ pub fn smart_grep_search(
 
         let mut file_match_count = 0usize;
         let mut file_lines = Vec::new();
+        let mut file_sym_key = index_key.clone();
+        let mut file_in_global = false;
 
         for (idx, line) in raw_content.lines().enumerate() {
             if re.is_match(line) {
-                if file_match_count == 0 {
-                    total_matched_file_bytes += raw_content.len();
-                    if !files_only && IndexedFileType::classify(&file_path).is_some() {
-                        let _ = ensure_single_file_indexed(conn, paths, &index_key);
-                    }
+                if file_match_count == 0
+                    && !files_only
+                    && IndexedFileType::classify(&file_path).is_some()
+                    && let Ok((sym_key, _, is_global)) =
+                        ensure_single_file_indexed(conn, paths, &index_key)
+                {
+                    file_sym_key = sym_key;
+                    file_in_global = is_global;
                 }
                 file_match_count += 1;
                 total_matches += 1;
@@ -1930,15 +1992,24 @@ pub fn smart_grep_search(
                     continue;
                 }
 
+                let sym_conn = if file_in_global {
+                    if gconn_cache.is_none() && paths.global_db.exists() {
+                        gconn_cache = init_connection(&paths.global_db).ok();
+                    }
+                    gconn_cache.as_ref().unwrap_or(conn)
+                } else {
+                    conn
+                };
+
                 let line_no = (idx + 1) as i64;
-                let enclosing: Option<(String, String, String, i64, i64)> = conn
+                let enclosing: Option<(String, String, String, i64, i64)> = sym_conn
                     .query_row(
                         "SELECT kind, name, signature, start_line, end_line
                          FROM symbols
                          WHERE file_path = ?1 AND start_line <= ?2 AND end_line >= ?2
                          ORDER BY (end_line - start_line) ASC
                          LIMIT 1",
-                        params![&index_key, line_no],
+                        params![&file_sym_key, line_no],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                     )
                     .optional()?;
@@ -2036,25 +2107,35 @@ pub fn smart_grep_search(
                 s.push('\n');
             }
             if cnt > lines.len() {
-                s.push_str(&format!(
-                    "  +{} more in {fp} (use `path=\"{fp}\"`)\n",
-                    cnt - lines.len()
-                ));
+                let already_scoped = trimmed_pf
+                    .is_some_and(|pf| pf == fp || pf.trim_start_matches("./") == fp);
+                if already_scoped {
+                    s.push_str(&format!(
+                        "  +{} more in {fp} (increase `max_per_file`)\n",
+                        cnt - lines.len()
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "  +{} more in {fp} (use `path=\"{fp}\"`)\n",
+                        cnt - lines.len()
+                    ));
+                }
             }
         }
         s
     };
 
-    let raw_bytes = total_matched_file_bytes.max(out.len());
-    Ok((out, raw_bytes))
+    Ok(out)
 }
+
+const MAX_REFERENCES_SHOWN: usize = 80;
 
 /// Finds all AST references (`call`, `type_use`, `import`) to `symbol` across the workspace.
 pub fn find_symbol_references(
     conn: &mut Connection,
     paths: &AppPaths,
     symbol: &str,
-) -> Result<(String, usize)> {
+) -> Result<String> {
     let raw_trimmed = symbol.trim();
     let clean = raw_trimmed
         .rsplit("::")
@@ -2068,29 +2149,22 @@ pub fn find_symbol_references(
         bail!("Provide a non-empty `symbol` to `find_references`");
     }
 
-    let stats = index_workspace(conn, paths, None)?;
+    index_workspace(conn, paths, None)?;
 
     let mut stmt = conn.prepare(
-        "SELECT r.file_path, r.line_number, r.caller_symbol, r.ref_kind, COALESCE(f.line_count, 50)
-         FROM symbol_refs r
-         LEFT JOIN file_hashes f ON r.file_path = f.file_path
-         WHERE r.symbol_name = ?1
+        "SELECT file_path, line_number, caller_symbol, ref_kind
+         FROM symbol_refs
+         WHERE symbol_name = ?1
          ORDER BY
-           CASE WHEN r.file_path LIKE '/%' THEN 1 ELSE 0 END ASC,
-           CASE WHEN r.ref_kind = 'import' THEN 0 ELSE 1 END ASC,
-           r.file_path ASC,
-           r.line_number ASC",
+           CASE WHEN file_path LIKE '/%' THEN 1 ELSE 0 END ASC,
+           CASE WHEN ref_kind = 'import' THEN 0 ELSE 1 END ASC,
+           file_path ASC,
+           line_number ASC",
     )?;
 
-    let rows: Vec<(String, i64, Option<String>, String, i64)> = stmt
+    let rows: Vec<(String, i64, Option<String>, String)> = stmt
         .query_map(params![clean], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -2107,8 +2181,7 @@ pub fn find_symbol_references(
         } else {
             format!(" Did you mean: `{}`?", suggestions.join("`, `"))
         };
-        let msg = format!("No references found for symbol '{clean}'.{hint}");
-        return Ok((msg.clone(), stats.total_raw_bytes.max(msg.len())));
+        return Ok(format!("No references found for symbol '{clean}'.{hint}"));
     }
 
     let defs: Vec<String> = {
@@ -2133,8 +2206,6 @@ pub fn find_symbol_references(
             .collect()
     };
 
-    let mut seen_files = HashSet::new();
-    let mut raw_bytes = 0usize;
     let mut out = if defs.is_empty() {
         format!("{clean} referenced in {} location(s):\n", rows.len())
     } else {
@@ -2146,16 +2217,16 @@ pub fn find_symbol_references(
     };
 
     let mut hop1_callers: Vec<String> = Vec::new();
-    for (fp, line, caller, kind, line_cnt) in &rows {
-        if seen_files.insert(fp.clone()) {
-            raw_bytes += (*line_cnt as usize).saturating_mul(45);
-        }
+    for (idx, (fp, line, caller, kind)) in rows.iter().enumerate() {
         if let Some(c) = caller
             && c != clean
             && !hop1_callers.contains(c)
             && hop1_callers.len() < 12
         {
             hop1_callers.push(c.clone());
+        }
+        if idx >= MAX_REFERENCES_SHOWN {
+            continue;
         }
         match (kind.as_str(), caller.as_deref()) {
             ("import", None) => {
@@ -2171,6 +2242,12 @@ pub fn find_symbol_references(
                 out.push_str(&format!("- {fp}:{line} ({kind})\n"));
             }
         }
+    }
+    if rows.len() > MAX_REFERENCES_SHOWN {
+        out.push_str(&format!(
+            "... (+{} more references truncated)\n",
+            rows.len() - MAX_REFERENCES_SHOWN
+        ));
     }
 
     // 2-hop call graph impact: find callers of the 1-hop enclosing caller functions
@@ -2211,7 +2288,7 @@ pub fn find_symbol_references(
         }
     }
 
-    Ok((out.clone(), raw_bytes.max(out.len())))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2232,10 +2309,7 @@ mod tests {
         fs::write(ws_doc.join("old.mdx"), "# Old\nTo be deleted.\n").unwrap();
         fs::write(gl_doc.join("g.mdx"), "# Global\nStable global doc.\n").unwrap();
 
-        let mut paths = AppPaths::from_root(temp.clone()).unwrap();
-        paths.global_dir = temp.join("global_cfg");
-        paths.global_db = paths.global_dir.join("global.db");
-        paths.global_config_file = paths.global_dir.join("config.json");
+        let paths = AppPaths::from_root_with_global_dir(temp.clone(), temp.join("global_cfg"));
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
 
@@ -2297,6 +2371,8 @@ mod tests {
             .unwrap();
         assert_eq!(old_count, 0);
 
+        drop(gconn);
+        drop(conn);
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -2319,16 +2395,13 @@ mod tests {
         fs::write(docs_dir.join("helper.py"), py_code).unwrap();
         fs::write(docs_dir.join("math.cpp"), cpp_code).unwrap();
 
-        let mut paths = AppPaths::from_root(temp.clone()).unwrap();
-        paths.global_dir = temp.join("global_cfg");
-        paths.global_db = paths.global_dir.join("global.db");
-        paths.global_config_file = paths.global_dir.join("config.json");
+        let paths = AppPaths::from_root_with_global_dir(temp.clone(), temp.join("global_cfg"));
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
         paths.add_doc(DocScope::Workspace, &docs_dir, "sdk").unwrap();
 
         let mut conn = init_connection(&paths.local_db).unwrap();
-        let (rs_out, _) = crate::memory::search_docs(
+        let rs_out = crate::docs::search_docs(
             &mut conn,
             &paths,
             "compute_widget",
@@ -2342,7 +2415,7 @@ mod tests {
         assert!(rs_out.contains("step_160\n}"));
         assert!(!rs_out.contains("truncated to token budget"));
 
-        let (py_out, _) = crate::memory::search_docs(
+        let py_out = crate::docs::search_docs(
             &mut conn,
             &paths,
             "greet_user",
@@ -2354,7 +2427,7 @@ mod tests {
         .unwrap();
         assert!(py_out.contains("def greet_user"));
 
-        let (cpp_out, _) = crate::memory::search_docs(
+        let cpp_out = crate::docs::search_docs(
             &mut conn,
             &paths,
             "calc_sum",
@@ -2366,6 +2439,7 @@ mod tests {
         .unwrap();
         assert!(cpp_out.contains("int calc_sum"));
 
+        drop(conn);
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -2393,23 +2467,20 @@ mod tests {
         )
         .unwrap();
 
-        let mut paths = AppPaths::from_root(temp.clone()).unwrap();
-        paths.global_dir = temp.join("global_cfg");
-        paths.global_db = paths.global_dir.join("global.db");
-        paths.global_config_file = paths.global_dir.join("config.json");
+        let paths = AppPaths::from_root_with_global_dir(temp.clone(), temp.join("global_cfg"));
         paths.ensure_local_dirs().unwrap();
         paths.ensure_global_dirs().unwrap();
 
         let mut conn = init_connection(&paths.local_db).unwrap();
 
         // 1. PageRank puts src/z_core.rs ahead of src/a_leaf.rs despite alphabetical order
-        let (map_out, _) = build_project_map(&mut conn, &paths, None, 800).unwrap();
+        let map_out = build_project_map(&mut conn, &paths, None, 800).unwrap();
         let pos_z = map_out.find("src/z_core.rs").unwrap();
         let pos_a = map_out.find("src/a_leaf.rs").unwrap();
         assert!(pos_z < pos_a, "Expected PageRank to rank src/z_core.rs before src/a_leaf.rs:\n{map_out}");
 
         // 2. Fuzzy subsequence symbol lookup resolves "exec_core_eng" -> "execute_core_engine"
-        let (sym_out, _) = read_symbol_range(
+        let sym_out = read_symbol_range(
             &mut conn,
             &paths,
             None,
@@ -2425,12 +2496,12 @@ mod tests {
         assert!(sym_out.contains("pub fn execute_core_engine"));
 
         // 3. 2-hop call graph impact: execute_core_engine -> called by run_middle_stage -> called by top_entry_handler
-        let (refs_out, _) =
-            find_symbol_references(&mut conn, &paths, "execute_core_engine").unwrap();
+        let refs_out = find_symbol_references(&mut conn, &paths, "execute_core_engine").unwrap();
         assert!(refs_out.contains("[in fn run_middle_stage] (call)"));
         assert!(refs_out.contains("2-hop caller impact:"));
         assert!(refs_out.contains("[in fn top_entry_handler] -> calls run_middle_stage"));
 
+        drop(conn);
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -2439,6 +2510,9 @@ mod tests {
         assert!(is_unsafe_workspace_root(Path::new("/")));
         if let Some(home) = dirs::home_dir() {
             assert!(is_unsafe_workspace_root(&home));
+        }
+        if let Some(cfg) = dirs::config_dir() {
+            assert!(is_unsafe_workspace_root(&cfg));
         }
 
         let temp = std::env::temp_dir().join(format!("lee_guard_test_{}", std::process::id()));
@@ -2463,6 +2537,7 @@ mod tests {
         let temp = std::env::temp_dir().join(format!("lee_ux_fix_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(temp.join("src")).unwrap();
+        fs::create_dir_all(temp.join("src2")).unwrap();
 
         let mut big = String::new();
         for i in 1..=220 {
@@ -2474,17 +2549,15 @@ mod tests {
             "use ort::Session;\nfn sort_report() { let import = 1; }\nfn real_ort() { let ort_val = ort::init(); }\n",
         )
         .unwrap();
+        fs::write(temp.join("src2/other.rs"), "pub fn other() {}\n").unwrap();
 
-        let mut paths = AppPaths::from_root(temp.clone()).unwrap();
-        paths.global_dir = temp.join("global_cfg");
-        paths.global_db = paths.global_dir.join("global.db");
-        paths.global_config_file = paths.global_dir.join("config.json");
+        let paths = AppPaths::from_root_with_global_dir(temp.clone(), temp.join("global_cfg"));
         paths.ensure_local_dirs().unwrap();
 
         let mut conn = init_connection(&paths.local_db).unwrap();
 
         // Explicit start_line=1, end_line=180 must NOT add context_lines=2 or bogus pagination
-        let (exact_out, _) = read_symbol_range(
+        let exact_out = read_symbol_range(
             &mut conn,
             &paths,
             Some("src/long.rs"),
@@ -2500,8 +2573,24 @@ mod tests {
         assert!(exact_out.contains("[1..180 of 220]"));
         assert!(!exact_out.contains("paginated at"));
 
+        // end_line alone reads lines 1..=end_line
+        let head_out = read_symbol_range(
+            &mut conn,
+            &paths,
+            Some("src/long.rs"),
+            None,
+            None,
+            Some(10),
+            2,
+            false,
+            false,
+            180,
+        )
+        .unwrap();
+        assert!(head_out.contains("[1..10 of 220]"));
+
         // Manual start_line=1 without end_line paginates cleanly with next slice 181..220
-        let (paged_out, _) = read_symbol_range(
+        let paged_out = read_symbol_range(
             &mut conn,
             &paths,
             Some("src/long.rs"),
@@ -2517,7 +2606,7 @@ mod tests {
         assert!(paged_out.contains("start_line=181, end_line=220"));
 
         // whole_word=true matches `ort` without matching `sort_report` or `import`
-        let (grep_out, _) = smart_grep_search(
+        let grep_out = smart_grep_search(
             &conn,
             &paths,
             "ort",
@@ -2534,6 +2623,46 @@ mod tests {
         assert!(grep_out.contains("ort::init()"));
         assert!(!grep_out.contains("sort_report"));
 
+        // Invalid `path` in smart_grep must return an error instead of falling back to full workspace
+        assert!(smart_grep_search(
+            &conn,
+            &paths,
+            "ort",
+            None,
+            Some("does_not_exist"),
+            false,
+            false,
+            false,
+            10,
+            30,
+        )
+        .is_err());
+
+        // project_map subpath="src" must not match sibling "src2/other.rs", and "./" maps whole project
+        let src_map = build_project_map(&mut conn, &paths, Some("src"), 800).unwrap();
+        assert!(src_map.contains("src/words.rs"));
+        assert!(!src_map.contains("src2/other.rs"));
+        let dot_slash_map = build_project_map(&mut conn, &paths, Some("./"), 800).unwrap();
+        assert!(dot_slash_map.contains("src2/other.rs"));
+
+        // purge_source_from_db handles in-repo workspace docs and SQL LIKE wildcards (`_`)
+        fs::create_dir_all(temp.join("a_b")).unwrap();
+        fs::create_dir_all(temp.join("axb")).unwrap();
+        fs::write(temp.join("a_b/one.md"), "# One\n").unwrap();
+        fs::write(temp.join("axb/two.md"), "# Two\n").unwrap();
+        index_workspace(&mut conn, &paths, None).unwrap();
+        let purged = purge_source_from_db(&conn, Some(&paths.project_root), &temp.join("a_b")).unwrap();
+        assert_eq!(purged, 1);
+        let axb_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_hashes WHERE file_path = 'axb/two.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(axb_left, 1);
+
+        drop(conn);
         let _ = fs::remove_dir_all(&temp);
     }
 }

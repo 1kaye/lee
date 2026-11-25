@@ -1,14 +1,14 @@
-pub mod config;
-pub mod db;
-pub mod digest;
-pub mod hooks;
-pub mod indexer;
-pub mod mcp;
-pub mod memory;
-pub mod security;
+mod config;
+mod db;
+mod digest;
+mod docs;
+mod hooks;
+mod indexer;
+mod mcp;
+mod security;
 
 use crate::config::{default_doc_name, AppPaths, DocEntry, DocScope};
-use crate::db::init_connection;
+use crate::db::{init_connection, init_in_memory_connection};
 use crate::digest::run_command_digest_with_exit;
 use crate::hooks::{
     auto_sync_agents_md, install_antigravity_hook_plugin, process_antigravity_hook,
@@ -19,13 +19,14 @@ use crate::indexer::{
     update_registered_docs,
 };
 use crate::mcp::run_stdio_server;
-use anyhow::Result;
+use crate::security::{expand_tilde, is_denied_path};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub const AGENTS_MD_RULES: &str = include_str!("../AGENTS.md");
+const AGENTS_MD_RULES: &str = include_str!("../AGENTS.md");
 
 #[derive(Parser)]
 #[command(
@@ -42,12 +43,8 @@ struct Cli {
 enum Commands {
     /// Run the JSON-RPC 2.0 MCP server over stdin/stdout
     Serve,
-    /// Initialize .lee/, PreToolUse hook, and SQLite FTS5 schemas
-    Init {
-        /// Also initialize global database and hook in ~/.config/lee & ~/.gemini/config/plugins/lee
-        #[arg(long)]
-        global: bool,
-    },
+    /// One-time global setup: ~/.config/lee/ DB + global Antigravity PreToolUse plugin (zero files in repos)
+    Init,
     /// Execute a shell command and compress its output via `run_digest` (used by PreToolUse hooks or CLI)
     Exec {
         /// Command string or arguments to execute and digest
@@ -62,7 +59,7 @@ enum Commands {
         /// Custom name for this docs entry (prompts interactively if omitted)
         #[arg(short = 'n', long = "name")]
         name: Option<String>,
-        /// Register in current workspace (.lee/config.json, default)
+        /// Register in current workspace (~/.config/lee/projects/<slug>/config.json, default)
         #[arg(short = 'w', long = "workspace", visible_alias = "w", conflicts_with = "global")]
         workspace: bool,
         /// Register globally (~/.config/lee/config.json, available in all workspaces)
@@ -81,6 +78,7 @@ enum Commands {
     #[command(visible_alias = "rm-docs", alias = "rm-source", alias = "remove-source")]
     RemoveDocs {
         /// Name, path, or 1-based number of the doc to remove
+        #[arg(conflicts_with = "all")]
         target: Option<String>,
         /// Target workspace docs only
         #[arg(short = 'w', long = "workspace", visible_alias = "w", conflicts_with = "global")]
@@ -96,7 +94,7 @@ enum Commands {
     Index,
     /// Show current workspace index status and registered docs
     Status,
-    /// Revert configuration & index files created by `init` without deleting .lee/.notes/
+    /// Remove centralized cache and any legacy .lee/ files for this project (preserving .lee/.notes/)
     Undo {
         /// Skip `[y/N]` confirmation prompt
         #[arg(short, long)]
@@ -124,17 +122,19 @@ enum HookEvent {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cwd = std::env::current_dir()?;
-    let paths = AppPaths::discover(&cwd)?;
 
-    if !matches!(cli.command, Commands::Undo { .. }) {
-        let _ = auto_sync_agents_md(&paths, AGENTS_MD_RULES);
+    // Fast zero-FS path for PreToolUse hooks (must work even if cwd is unavailable)
+    if let Commands::Hook { event } = cli.command {
+        return cmd_hook(event);
     }
+
+    let cwd = std::env::current_dir()?;
+    let paths = AppPaths::discover(&cwd);
 
     match cli.command {
         Commands::Serve => run_stdio_server(&paths),
-        Commands::Init { global } => cmd_init(&paths, global),
-        Commands::Exec { command } => cmd_exec(&paths, &command),
+        Commands::Init => cmd_init(&paths),
+        Commands::Exec { command } => cmd_exec(&paths, &cwd, &command),
         Commands::AddDocs {
             path,
             name,
@@ -171,98 +171,108 @@ fn main() -> Result<()> {
         Commands::Index => cmd_index(&paths),
         Commands::Status => cmd_status(&paths),
         Commands::Undo { yes } => cmd_undo(&paths, yes),
-        Commands::Hook { event } => cmd_hook(event),
+        Commands::Hook { .. } => unreachable!(),
     }
 }
 
-fn cmd_init(paths: &AppPaths, global: bool) -> Result<()> {
-    if is_unsafe_workspace_root(&paths.project_root) {
-        anyhow::bail!(
-            "Refusing to initialize lee workspace in '{}' (HOME or filesystem root). Run `lee init` inside a project directory.",
-            paths.project_root.display()
-        );
-    }
-    paths.ensure_local_dirs()?;
+fn cmd_init(paths: &AppPaths) -> Result<()> {
     paths.ensure_global_dirs()?;
-    paths.ensure_gitignore(&[".lee/", ".agents/plugins/lee/"])?;
+    let _ = init_connection(&paths.global_db)?;
 
-    let cfg = paths.load_config().unwrap_or_default();
+    let global_agents_md = paths.global_dir.join("AGENTS.md");
+    fs::write(&global_agents_md, AGENTS_MD_RULES.trim_start())?;
 
-    let legacy_local_agents = paths.local_dir.join("AGENTS.md");
-    if legacy_local_agents.exists() {
-        let _ = fs::remove_file(&legacy_local_agents);
-    }
-
-    if global {
-        let global_agents_md = paths.global_dir.join("AGENTS.md");
-        fs::write(&global_agents_md, AGENTS_MD_RULES.trim_start())?;
-    }
+    let plugin_dir = install_antigravity_hook_plugin(AGENTS_MD_RULES)?;
     let _ = auto_sync_agents_md(paths, AGENTS_MD_RULES);
-    paths.save_config(&cfg)?;
-
-    let mut local_conn = init_connection(&paths.local_db)?;
-    if global || !paths.global_db.exists() {
-        let _ = init_connection(&paths.global_db)?;
-    }
 
     println!(
-        "[lee] Initialized local workspace at {}",
-        paths.local_dir.display()
-    );
-    println!(
-        "[lee] Global directory ready at {}",
+        "[lee] Global storage ready at {} (per-project caches live in {}/projects/)",
+        paths.global_dir.display(),
         paths.global_dir.display()
     );
-
-    let stats = index_workspace(&mut local_conn, paths, None)?;
     println!(
-        "[lee] Indexed {} files ({} code symbols, {} symbol refs, {} md headings, {} doc sections) in {} ms.",
-        stats.files_scanned,
-        stats.code_symbols,
-        stats.symbol_refs,
-        stats.md_headings,
-        stats.doc_sections,
-        stats.elapsed_ms
-    );
-
-    let plugin_dir =
-        install_antigravity_hook_plugin(&paths.project_root, global, AGENTS_MD_RULES)?;
-    println!(
-        "[lee] Installed Antigravity PreToolUse hook plugin at {}",
+        "[lee] Installed global Antigravity PreToolUse plugin at {}",
         plugin_dir.display()
     );
+
+    if is_unsafe_workspace_root(&paths.project_root) {
+        println!(
+            "[lee] Skipped workspace indexing for '{}' (HOME/config/root). Any project you open will auto-index on first MCP call.",
+            paths.project_root.display()
+        );
+    } else {
+        paths.ensure_local_dirs()?;
+        let mut local_conn = init_connection(&paths.local_db)?;
+        let stats = index_workspace(&mut local_conn, paths, None)?;
+        println!(
+            "[lee] Pre-indexed current project ({} -> {}): {} files, {} code symbols, {} symbol refs, {} md headings ({} ms).",
+            paths.project_root.display(),
+            paths.local_db.display(),
+            stats.files_scanned,
+            stats.code_symbols,
+            stats.symbol_refs,
+            stats.md_headings,
+            stats.elapsed_ms
+        );
+    }
 
     Ok(())
 }
 
-fn cmd_exec(paths: &AppPaths, command_parts: &[String]) -> Result<()> {
-    paths.ensure_local_dirs()?;
-    let conn = init_connection(&paths.local_db)?;
+fn cmd_exec(paths: &AppPaths, cwd: &Path, command_parts: &[String]) -> Result<()> {
+    // Fall back to an in-memory SQLite DB when ~/.config/lee is read-only (e.g. inside a terminal sandbox)
+    let conn = match paths
+        .ensure_local_dirs()
+        .and_then(|_| init_connection(&paths.local_db))
+    {
+        Ok(c) => c,
+        Err(_) => init_in_memory_connection()?,
+    };
+
     let full_cmd = command_parts.join(" ");
-    let (out, _raw_bytes, exit_code) =
-        run_command_digest_with_exit(&conn, paths, &full_cmd, None)?;
+    let rel_cwd = cwd
+        .strip_prefix(&paths.project_root)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_string_lossy().into_owned());
+
+    let (out, exit_code) =
+        run_command_digest_with_exit(&conn, paths, &full_cmd, rel_cwd.as_deref())?;
     print!("{out}");
-    if !out.ends_with('\n') {
+    if !out.is_empty() && !out.ends_with('\n') {
         println!();
     }
-    if exit_code > 0 {
-        std::process::exit(exit_code);
+    if exit_code != 0 {
+        std::process::exit(if exit_code > 0 { exit_code } else { 1 });
     }
     Ok(())
 }
 
 fn cmd_add_docs(
     paths: &AppPaths,
-    source_path: &std::path::Path,
+    source_path: &Path,
     name: Option<&str>,
     scope: DocScope,
 ) -> Result<()> {
-    let canonical = fs::canonicalize(source_path)
-        .map_err(|e| anyhow::anyhow!("Docs path does not exist: {} ({e})", source_path.display()))?;
+    let expanded = expand_tilde(source_path);
+    let canonical = fs::canonicalize(&expanded)
+        .map_err(|e| anyhow::anyhow!("Docs path does not exist: {} ({e})", expanded.display()))?;
     if is_unsafe_workspace_root(&canonical) {
-        anyhow::bail!(
-            "Refusing to register '{}' (HOME or filesystem root) as a docs directory.",
+        bail!(
+            "Refusing to register '{}' (HOME, config, or filesystem root) as a docs directory.",
             canonical.display()
+        );
+    }
+    if is_denied_path(&canonical) {
+        bail!(
+            "Refusing to register '{}' because it matches the sensitive-file deny-list.",
+            canonical.display()
+        );
+    }
+    if scope == DocScope::Workspace && is_unsafe_workspace_root(&paths.project_root) {
+        bail!(
+            "Refusing to register workspace doc under unsafe root '{}'. Use `--g` for global docs or run inside a project directory.",
+            paths.project_root.display()
         );
     }
 
@@ -365,7 +375,8 @@ fn cmd_docs_update(paths: &AppPaths) -> Result<()> {
     let global_docs = paths.load_global_config().unwrap_or_default().docs;
     let has_ws_docs = !ws_docs.is_empty();
 
-    let mut all_docs: Vec<(DocScope, DocEntry)> = Vec::with_capacity(ws_docs.len() + global_docs.len());
+    let mut all_docs: Vec<(DocScope, DocEntry)> =
+        Vec::with_capacity(ws_docs.len() + global_docs.len());
     for doc in ws_docs {
         all_docs.push((DocScope::Workspace, doc));
     }
@@ -433,9 +444,13 @@ fn purge_removed_docs_if_unused(
     if removed.is_empty() {
         return Ok(0);
     }
-    let (db_path, remaining) = match scope {
-        DocScope::Workspace => (&paths.local_db, paths.workspace_doc_paths()),
-        DocScope::Global => (&paths.global_db, paths.global_doc_paths()),
+    let (db_path, project_root, remaining) = match scope {
+        DocScope::Workspace => (
+            &paths.local_db,
+            Some(paths.project_root.as_path()),
+            paths.workspace_doc_paths(),
+        ),
+        DocScope::Global => (&paths.global_db, None, paths.global_doc_paths()),
     };
     if !db_path.exists() {
         return Ok(0);
@@ -444,10 +459,22 @@ fn purge_removed_docs_if_unused(
     let mut purged_files = 0usize;
     for entry in removed {
         if !remaining.contains(&entry.path) {
-            purged_files += purge_source_from_db(&conn, &entry.path)?;
+            purged_files += purge_source_from_db(&conn, project_root, &entry.path)?;
         }
     }
     Ok(purged_files)
+}
+
+fn finish_single_doc_removal(paths: &AppPaths, scope: DocScope, removed: DocEntry) -> Result<()> {
+    let purged = purge_removed_docs_if_unused(paths, scope, std::slice::from_ref(&removed))?;
+    println!(
+        "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s).",
+        scope.as_str(),
+        removed.name,
+        removed.path.display(),
+        purged
+    );
+    Ok(())
 }
 
 fn cmd_remove_docs(
@@ -476,52 +503,22 @@ fn cmd_remove_docs(
     if let Some(raw_target) = target.map(str::trim).filter(|s| !s.is_empty()) {
         if let Some(scope) = scope_filter {
             let Some(removed) = paths.remove_doc(scope, raw_target)? else {
-                anyhow::bail!(
+                bail!(
                     "No {} doc matched '{}'. Run `lee docs` to see registered docs.",
                     scope.as_str(),
                     raw_target
                 );
             };
-            let purged = purge_removed_docs_if_unused(paths, scope, std::slice::from_ref(&removed))?;
-            println!(
-                "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s).",
-                scope.as_str(),
-                removed.name,
-                removed.path.display(),
-                purged
-            );
-            return Ok(());
+            return finish_single_doc_removal(paths, scope, removed);
         }
 
         if let Some(removed) = paths.remove_doc(DocScope::Workspace, raw_target)? {
-            let purged = purge_removed_docs_if_unused(
-                paths,
-                DocScope::Workspace,
-                std::slice::from_ref(&removed),
-            )?;
-            println!(
-                "[lee] Removed workspace doc '{}' ({}) and purged {} indexed file(s).",
-                removed.name,
-                removed.path.display(),
-                purged
-            );
-            return Ok(());
+            return finish_single_doc_removal(paths, DocScope::Workspace, removed);
         }
         if let Some(removed) = paths.remove_doc(DocScope::Global, raw_target)? {
-            let purged = purge_removed_docs_if_unused(
-                paths,
-                DocScope::Global,
-                std::slice::from_ref(&removed),
-            )?;
-            println!(
-                "[lee] Removed global doc '{}' ({}) and purged {} indexed file(s).",
-                removed.name,
-                removed.path.display(),
-                purged
-            );
-            return Ok(());
+            return finish_single_doc_removal(paths, DocScope::Global, removed);
         }
-        anyhow::bail!("No workspace or global doc matched '{raw_target}'. Run `lee docs` to see registered docs.");
+        bail!("No workspace or global doc matched '{raw_target}'. Run `lee docs` to see registered docs.");
     }
 
     let ws_docs = if scope_filter == Some(DocScope::Global) {
@@ -590,16 +587,9 @@ fn cmd_remove_docs(
         && idx <= combined.len()
     {
         let (sc, ref entry) = combined[idx - 1];
-        if let Some(removed) = paths.remove_doc(sc, &entry.name)? {
-            let purged = purge_removed_docs_if_unused(paths, sc, std::slice::from_ref(&removed))?;
-            println!(
-                "[lee] Removed {} doc '{}' ({}) and purged {} indexed file(s).",
-                sc.as_str(),
-                removed.name,
-                removed.path.display(),
-                purged
-            );
-            return Ok(());
+        let target_path = entry.path.to_string_lossy().into_owned();
+        if let Some(removed) = paths.remove_doc(sc, &target_path)? {
+            return finish_single_doc_removal(paths, sc, removed);
         }
     }
 
@@ -607,6 +597,12 @@ fn cmd_remove_docs(
 }
 
 fn cmd_index(paths: &AppPaths) -> Result<()> {
+    if is_unsafe_workspace_root(&paths.project_root) {
+        bail!(
+            "Refusing to index unsafe workspace root '{}' (HOME, config, or filesystem root). Run `lee index` inside a project directory.",
+            paths.project_root.display()
+        );
+    }
     paths.ensure_local_dirs()?;
     let mut conn = init_connection(&paths.local_db)?;
     let stats = index_workspace(&mut conn, paths, None)?;
@@ -624,11 +620,12 @@ fn cmd_index(paths: &AppPaths) -> Result<()> {
     if !paths.global_doc_paths().is_empty() {
         let gstats = index_global_docs(paths)?;
         println!(
-            "[lee] Indexed global docs ({}): {} files ({} re-indexed, {} cached) | {} md headings | {} doc sections in {} ms.",
+            "[lee] Indexed global docs ({}): {} files ({} re-indexed, {} cached) | {} code symbols | {} md headings | {} doc sections in {} ms.",
             paths.global_db.display(),
             gstats.files_scanned,
             gstats.files_reindexed,
             gstats.files_cached,
+            gstats.code_symbols,
             gstats.md_headings,
             gstats.doc_sections,
             gstats.elapsed_ms
@@ -704,27 +701,34 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
         );
     }
 
-    if paths.global_db.exists() {
-        if let Ok(gconn) = init_connection(&paths.global_db) {
-            let gfiles: i64 = gconn
-                .query_row("SELECT COUNT(*) FROM file_hashes", [], |r| r.get(0))
-                .unwrap_or(0);
-            let gheadings: i64 = gconn
-                .query_row(
-                    "SELECT COUNT(*) FROM symbols WHERE kind = 'md_heading'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let gsections: i64 = gconn
-                .query_row("SELECT COUNT(*) FROM doc_sections_meta", [], |r| r.get(0))
-                .unwrap_or(0);
-            if gfiles > 0 {
-                println!(
-                    "Global Index : {gfiles} files | {gheadings} md headings | {gsections} doc windows ({})",
-                    paths.global_db.display()
-                );
-            }
+    if paths.global_db.exists()
+        && let Ok(gconn) = init_connection(&paths.global_db)
+    {
+        let gfiles: i64 = gconn
+            .query_row("SELECT COUNT(*) FROM file_hashes", [], |r| r.get(0))
+            .unwrap_or(0);
+        let gsyms: i64 = gconn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE kind != 'md_heading'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let gheadings: i64 = gconn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE kind = 'md_heading'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let gsections: i64 = gconn
+            .query_row("SELECT COUNT(*) FROM doc_sections_meta", [], |r| r.get(0))
+            .unwrap_or(0);
+        if gfiles > 0 {
+            println!(
+                "Global Index : {gfiles} files | {gsyms} code symbols | {gheadings} md headings | {gsections} doc windows ({})",
+                paths.global_db.display()
+            );
         }
     }
 
@@ -732,13 +736,14 @@ fn cmd_status(paths: &AppPaths) -> Result<()> {
 }
 
 fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
+    let legacy_repo_lee = paths.project_root.join(".lee");
     let local_hook_plugin = paths.project_root.join(".agents/plugins/lee");
-    if !paths.local_dir.exists() && !local_hook_plugin.exists() {
-        println!("[lee] Nothing to undo in {}.", paths.project_root.display());
+    if !paths.local_dir.exists() && !legacy_repo_lee.exists() && !local_hook_plugin.exists() {
+        println!("[lee] Nothing to undo for {}.", paths.project_root.display());
         return Ok(());
     }
 
-    let legacy_notes_dir = paths.local_dir.join(".notes");
+    let legacy_notes_dir = legacy_repo_lee.join(".notes");
     let has_notes = legacy_notes_dir.is_dir()
         && fs::read_dir(&legacy_notes_dir)
             .map(|mut d| d.next().is_some())
@@ -746,16 +751,22 @@ fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
 
     if !yes {
         println!(
-            "[lee] This will remove lee index/config/hook files in {}:",
+            "[lee] This will remove lee cache/config/legacy repo files for {}:",
             paths.project_root.display()
         );
+        if paths.local_dir.exists() {
+            println!("  - Centralized cache {} will be removed.", paths.local_dir.display());
+        }
+        if local_hook_plugin.exists() {
+            println!("  - Local plugin {} will be removed.", local_hook_plugin.display());
+        }
         if has_notes {
             println!(
                 "  - Existing notes in {} WILL BE PRESERVED.",
                 legacy_notes_dir.display()
             );
-        } else {
-            println!("  - .lee/ directory will be removed.");
+        } else if legacy_repo_lee.exists() {
+            println!("  - Legacy {} directory will be removed.", legacy_repo_lee.display());
         }
         print!("Proceed with undo? [y/N]: ");
         io::stdout().flush()?;
@@ -768,36 +779,37 @@ fn cmd_undo(paths: &AppPaths, yes: bool) -> Result<()> {
         }
     }
 
-    for file in [
-        paths.local_db.clone(),
-        paths.local_dir.join("lee.db-wal"),
-        paths.local_dir.join("lee.db-shm"),
-        paths.config_file.clone(),
-        paths.local_dir.join("AGENTS.md"),
-    ] {
-        if file.exists() {
-            let _ = fs::remove_file(&file);
-        }
+    if paths.local_dir.exists() {
+        fs::remove_dir_all(&paths.local_dir)?;
     }
 
     if local_hook_plugin.exists() {
-        let _ = fs::remove_dir_all(&local_hook_plugin);
+        fs::remove_dir_all(&local_hook_plugin)?;
     }
 
-    if !has_notes && paths.local_dir.exists() {
-        fs::remove_dir_all(&paths.local_dir)?;
+    if has_notes {
+        for file in [
+            legacy_repo_lee.join("lee.db"),
+            legacy_repo_lee.join("lee.db-wal"),
+            legacy_repo_lee.join("lee.db-shm"),
+            legacy_repo_lee.join("config.json"),
+            legacy_repo_lee.join("AGENTS.md"),
+        ] {
+            if file.exists() {
+                fs::remove_file(&file)?;
+            }
+        }
+    } else if legacy_repo_lee.exists() {
+        fs::remove_dir_all(&legacy_repo_lee)?;
+    }
+
+    if has_notes {
         println!(
-            "[lee] Undo complete. Removed {} directory (no Markdown notes to preserve).",
-            paths.local_dir.display()
-        );
-    } else if paths.local_dir.exists() {
-        println!(
-            "[lee] Undo complete. Removed index/config files in {} (preserved existing notes in {}).",
-            paths.local_dir.display(),
+            "[lee] Undo complete (preserved existing notes in {}).",
             legacy_notes_dir.display()
         );
     } else {
-        println!("[lee] Undo complete.");
+        println!("[lee] Undo complete for {}.", paths.project_root.display());
     }
     Ok(())
 }
@@ -854,6 +866,13 @@ mod tests {
             cli.command,
             Commands::RemoveDocs { global: true, workspace: false, target: Some(ref t), .. } if t == "gpui kit"
         ));
+
+        // `--all` conflicts with an explicit target
+        assert!(Cli::try_parse_from(["lee", "rm-docs", "gpui", "--all"]).is_err());
+
+        // `lee init` takes no removed `--global` flag
+        assert!(Cli::try_parse_from(["lee", "init"]).is_ok());
+        assert!(Cli::try_parse_from(["lee", "init", "--global"]).is_err());
 
         let cli = Cli::try_parse_from(["lee", "add-source", "/tmp/gpui"]).unwrap();
         assert!(matches!(cli.command, Commands::AddDocs { .. }));

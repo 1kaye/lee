@@ -2,9 +2,9 @@ pub mod fts;
 
 use crate::config::{normalize_doc_name, AppPaths, DocEntry};
 use crate::db::init_connection;
+use crate::docs::fts::search_doc_sections_fts;
 use crate::indexer::{index_global_docs, index_workspace};
-use crate::memory::fts::search_doc_sections_fts;
-use crate::security::to_index_path;
+use crate::security::{escape_sql_like, normalize_abs_key, to_index_path};
 use anyhow::{bail, Result};
 use globset::GlobBuilder;
 use rusqlite::{params, Connection};
@@ -77,7 +77,8 @@ fn collect_doc_sections_from_db<F>(
 where
     F: Fn(&str) -> bool,
 {
-    let fts_ids = search_doc_sections_fts(conn, query, 100).unwrap_or_default();
+    // Fetch a generous FTS pool so post-filtering by `doc`/`file_filter` does not starve smaller docs
+    let fts_ids = search_doc_sections_fts(conn, query, 300).unwrap_or_default();
     if !fts_ids.is_empty() {
         let mut by_id = conn.prepare_cached(
             "SELECT file_path, heading, start_line, end_line, content
@@ -101,12 +102,15 @@ where
     }
 
     if matched_sections.len() < 8 {
-        let like_pat = format!("%{}%", query.trim().to_lowercase());
+        let escaped = escape_sql_like(&query.trim().to_lowercase());
+        let like_pat = format!("%{escaped}%");
         let mut like_stmt = conn.prepare(
             "SELECT file_path, heading, start_line, end_line, content
              FROM doc_sections_meta
-             WHERE LOWER(heading) LIKE ?1 OR LOWER(file_path) LIKE ?1 OR LOWER(content) LIKE ?1
-             LIMIT 80",
+             WHERE LOWER(heading) LIKE ?1 ESCAPE '\\'
+                OR LOWER(file_path) LIKE ?1 ESCAPE '\\'
+                OR LOWER(content) LIKE ?1 ESCAPE '\\'
+             LIMIT 200",
         )?;
         let rows = like_stmt.query_map(params![like_pat], |r| {
             Ok(DocSectionRecord {
@@ -138,38 +142,42 @@ pub fn search_docs(
     doc_name: Option<&str>,
     scope: Option<&str>,
     budget_tokens: usize,
-) -> Result<(String, usize)> {
+) -> Result<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("Provide a non-empty `query` to `search_docs`");
+    }
+
     let scope_mode = match scope.map(|s| s.trim().to_lowercase()).as_deref() {
         None | Some("") | Some("all") => "all",
         Some("workspace") | Some("w") | Some("local") | Some("project") => "workspace",
         Some("global") | Some("g") => "global",
-        Some(other) => bail!("Invalid `scope` '{other}'. Expected 'workspace', 'global', or 'all'."),
+        Some(other) => {
+            bail!("Invalid `scope` '{other}'. Expected 'workspace', 'global', or 'all'.")
+        }
     };
 
     let ws_docs = paths.load_config().unwrap_or_default().docs;
     let global_docs = paths.load_global_config().unwrap_or_default().docs;
 
-    if scope_mode != "global" {
-        let _ = index_workspace(conn, paths, None)?;
-    }
-    if scope_mode != "workspace" && !global_docs.is_empty() {
-        let _ = index_global_docs(paths)?;
-    }
+    let doc_trim = doc_name.map(str::trim).filter(|s| !s.is_empty());
+    let mut query_local = scope_mode != "global";
+    let mut query_global = scope_mode != "workspace" && !global_docs.is_empty();
 
-    let doc_trim = doc_name.map(|s| s.trim()).filter(|s| !s.is_empty());
     let allowed_doc_keys: Option<Vec<String>> = if let Some(dname) = doc_trim {
-        let mut matched_paths = Vec::new();
+        let mut ws_matched = Vec::new();
+        let mut gl_matched = Vec::new();
         if scope_mode != "global" {
             for e in match_named_docs(&ws_docs, dname) {
-                matched_paths.push(to_index_path(&paths.project_root, &e.path));
+                ws_matched.push(to_index_path(&paths.project_root, &e.path));
             }
         }
         if scope_mode != "workspace" {
             for e in match_named_docs(&global_docs, dname) {
-                matched_paths.push(e.path.to_string_lossy().to_string());
+                gl_matched.push(normalize_abs_key(&e.path));
             }
         }
-        if matched_paths.is_empty() {
+        if ws_matched.is_empty() && gl_matched.is_empty() {
             let mut avail = Vec::new();
             for d in &ws_docs {
                 avail.push(format!("`{}` (workspace)", d.name));
@@ -182,24 +190,23 @@ pub fn search_docs(
             } else {
                 avail.join(", ")
             };
-            let msg = format!(
+            return Ok(format!(
                 "No registered doc matched '{dname}' in scope '{scope_mode}'. Available docs: {avail_str}.\n"
-            );
-            return Ok((msg.clone(), msg.len()));
+            ));
         }
-        Some(matched_paths)
+        // Only scan the DB(s) that actually own the matched doc(s) so global docs work even from $HOME
+        query_local = !ws_matched.is_empty();
+        query_global = !gl_matched.is_empty();
+        ws_matched.extend(gl_matched);
+        Some(ws_matched)
     } else if scope_mode == "global" {
         if global_docs.is_empty() {
-            let msg = "No global docs registered. Register one with `lee add-docs --g <path>`.\n"
-                .to_string();
-            return Ok((msg.clone(), msg.len()));
+            return Ok(
+                "No global docs registered. Register one with `lee add-docs --g <path>`.\n"
+                    .to_string(),
+            );
         }
-        Some(
-            global_docs
-                .iter()
-                .map(|e| e.path.to_string_lossy().to_string())
-                .collect(),
-        )
+        Some(global_docs.iter().map(|e| normalize_abs_key(&e.path)).collect())
     } else if scope_mode == "workspace" {
         Some(
             ws_docs
@@ -211,7 +218,14 @@ pub fn search_docs(
         None
     };
 
-    let filter_trim = file_filter.map(|s| s.trim()).filter(|s| !s.is_empty());
+    if query_local {
+        let _ = index_workspace(conn, paths, None)?;
+    }
+    if query_global {
+        let _ = index_global_docs(paths)?;
+    }
+
+    let filter_trim = file_filter.map(str::trim).filter(|s| !s.is_empty());
     let is_glob_pattern = filter_trim
         .map(|s| s.contains('*') || s.contains('?') || s.contains('['))
         .unwrap_or(false);
@@ -226,7 +240,8 @@ pub fn search_docs(
     } else {
         None
     };
-    let filter_substr = if !is_glob_pattern {
+    // Fall back to substring matching when glob compilation fails so malformed globs never disable filtering
+    let filter_substr = if filter_glob.is_none() {
         filter_trim.map(|s| s.to_lowercase())
     } else {
         None
@@ -235,7 +250,8 @@ pub fn search_docs(
     let matches_file = |fp: &str| -> bool {
         if let Some(ref keys) = allowed_doc_keys {
             let in_docs = keys.iter().any(|k| path_matches_doc_key(fp, k));
-            let in_workspace_local = doc_trim.is_none() && scope_mode == "workspace" && !fp.starts_with('/');
+            let in_workspace_local =
+                doc_trim.is_none() && scope_mode == "workspace" && !fp.starts_with('/');
             if !in_docs && !in_workspace_local {
                 return false;
             }
@@ -252,7 +268,7 @@ pub fn search_docs(
     let mut matched_sections: Vec<DocSectionRecord> = Vec::new();
     let mut seen_keys: HashSet<(String, i64, i64)> = HashSet::new();
 
-    if scope_mode != "global" {
+    if query_local {
         collect_doc_sections_from_db(
             conn,
             query,
@@ -262,29 +278,33 @@ pub fn search_docs(
         )?;
     }
 
-    if scope_mode != "workspace" && !global_docs.is_empty() && paths.global_db.exists() {
-        if let Ok(global_conn) = init_connection(&paths.global_db) {
-            let _ = collect_doc_sections_from_db(
-                &global_conn,
-                query,
-                &matches_file,
-                &mut matched_sections,
-                &mut seen_keys,
-            );
-        }
+    if query_global && paths.global_db.exists() {
+        let global_conn = init_connection(&paths.global_db)?;
+        collect_doc_sections_from_db(
+            &global_conn,
+            query,
+            &matches_file,
+            &mut matched_sections,
+            &mut seen_keys,
+        )?;
     }
 
     if matched_sections.is_empty() {
-        let msg = format!("No documentation sections matched query '{query}'.\n");
-        return Ok((msg.clone(), msg.len()));
+        return Ok(format!("No documentation sections matched query '{query}'.\n"));
     }
 
     let mut blocks = Vec::new();
     let mut seen_ranges: Vec<(String, i64, i64)> = Vec::new();
 
     for sec in matched_sections {
+        // Only skip a window if it is largely duplicated (>50% overlap), preserving adjacent 15-line overlap windows
+        let sec_len = (sec.end_line - sec.start_line + 1).max(1);
         if seen_ranges.iter().any(|(fp, st, en)| {
-            fp == &sec.file_path && sec.start_line <= *en && sec.end_line >= *st
+            if fp != &sec.file_path {
+                return false;
+            }
+            let overlap = (sec.end_line.min(*en) - sec.start_line.max(*st) + 1).max(0);
+            overlap * 2 > sec_len
         }) {
             continue;
         }
@@ -300,6 +320,5 @@ pub fn search_docs(
     }
 
     let body = apply_token_budget(&blocks, budget_tokens);
-    let out = format!("# Documentation Search Results (`{query}`)\n\n{body}");
-    Ok((out.clone(), out.len()))
+    Ok(format!("# Documentation Search Results (`{query}`)\n\n{body}"))
 }

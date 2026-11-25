@@ -7,24 +7,14 @@ use std::sync::OnceLock;
 const DENY_PATTERNS: &[&str] = &[
     ".env",
     ".env*",
-    "**/.env",
-    "**/.env*",
     "*.pem",
-    "**/*.pem",
     "*.key",
-    "**/*.key",
     "id_rsa*",
-    "**/id_rsa*",
     "id_ed25519*",
-    "**/id_ed25519*",
     "*secret*",
-    "**/*secret*",
     "*credentials*",
-    "**/*credentials*",
     "*.p12",
-    "**/*.p12",
     "*.pfx",
-    "**/*.pfx",
 ];
 
 fn deny_globset() -> &'static GlobSet {
@@ -43,25 +33,71 @@ fn deny_globset() -> &'static GlobSet {
     })
 }
 
-/// Checks if a path or any of its file/directory names matches the hardcoded sensitive file deny-list.
+/// Checks if a path or any of its file/directory components matches the hardcoded sensitive file deny-list.
 pub fn is_denied_path(path: &Path) -> bool {
     let set = deny_globset();
     if set.is_match(path) {
         return true;
     }
-    if let Some(name) = path.file_name() {
-        if set.is_match(Path::new(name)) {
+    for comp in path.components() {
+        if let Component::Normal(part) = comp
+            && set.is_match(Path::new(part))
+        {
             return true;
         }
     }
-    for comp in path.components() {
-        if let Component::Normal(part) = comp {
-            if set.is_match(Path::new(part)) {
-                return true;
-            }
-        }
-    }
     false
+}
+
+/// Checks `is_denied_path` only on the relative sub-path inside `base` so ancestor directory names
+/// outside the project/doc root (e.g. `/home/user/secret-app/`) never cause false positives.
+pub fn is_denied_relative_to(base: &Path, path: &Path) -> bool {
+    if let Ok(rel) = path.strip_prefix(base) {
+        if rel.as_os_str().is_empty() {
+            return path.file_name().is_some_and(|n| is_denied_path(Path::new(n)));
+        }
+        return is_denied_path(rel);
+    }
+    is_denied_path(path)
+}
+
+/// Expands a leading `~/` against the user's home directory.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    if let Some(s) = path.to_str()
+        && let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
+
+/// Resolves a potentially non-existent path by canonicalizing its deepest existing ancestor first
+/// so symlinks above non-existent nested paths cannot bypass confinement.
+fn resolve_with_ancestor_canonicalization(joined: &Path) -> Result<PathBuf> {
+    if joined.exists() {
+        return Ok(fs::canonicalize(joined)?);
+    }
+
+    let normalized = lexical_normalize(joined)?;
+    let mut existing = normalized.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return Ok(normalized);
+        };
+        tail.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return Ok(normalized);
+        };
+        existing = parent;
+    }
+
+    let mut resolved = fs::canonicalize(existing)?;
+    for part in tail.into_iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved)
 }
 
 /// Validates that `candidate` is inside `project_root` or one of `allowed_sources`,
@@ -71,60 +107,26 @@ pub fn validate_path(
     allowed_sources: &[PathBuf],
     candidate: &Path,
 ) -> Result<PathBuf> {
-    if is_denied_path(candidate) {
-        bail!(
-            "Security violation: access to sensitive file '{}' is blocked by deny-list",
-            candidate.display()
-        );
-    }
-
     let canon_root = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let canon_sources: Vec<PathBuf> = allowed_sources
         .iter()
         .map(|s| fs::canonicalize(s).unwrap_or_else(|_| s.clone()))
         .collect();
 
-    let expanded: PathBuf = if let Some(s) = candidate.to_str() {
-        if let Some(rest) = s.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(rest)
-            } else {
-                candidate.to_path_buf()
-            }
-        } else {
-            candidate.to_path_buf()
-        }
-    } else {
-        candidate.to_path_buf()
-    };
-
+    let expanded = expand_tilde(candidate);
     let joined = if expanded.is_absolute() {
         expanded
     } else {
+        if is_denied_path(&expanded) {
+            bail!(
+                "Security violation: access to sensitive file '{}' is blocked by deny-list",
+                candidate.display()
+            );
+        }
         canon_root.join(expanded)
     };
 
-    // Lexical normalization for non-existent paths, canonical resolution for existing ones
-    let resolved = if joined.exists() {
-        fs::canonicalize(&joined)?
-    } else if let Some(parent) = joined.parent() {
-        if parent.exists() {
-            let canon_parent = fs::canonicalize(parent)?;
-            if let Some(name) = joined.file_name() {
-                // Ensure no parent dir traversal in filename
-                if name == ".." || name == "." {
-                    bail!("Security violation: invalid path traversal in '{}'", candidate.display());
-                }
-                canon_parent.join(name)
-            } else {
-                canon_parent
-            }
-        } else {
-            lexical_normalize(&joined)?
-        }
-    } else {
-        lexical_normalize(&joined)?
-    };
+    let resolved = resolve_with_ancestor_canonicalization(&joined)?;
 
     let inside_root = resolved.starts_with(&canon_root);
     let inside_source = canon_sources.iter().any(|src| resolved.starts_with(src));
@@ -136,9 +138,9 @@ pub fn validate_path(
         );
     }
 
-    // Check relative components inside workspace against deny-list so parent folder names don't false-trigger
+    // Check relative components inside workspace/source so parent folder names outside root don't false-trigger
     if let Ok(rel) = resolved.strip_prefix(&canon_root) {
-        if is_denied_path(rel) {
+        if !rel.as_os_str().is_empty() && is_denied_path(rel) {
             bail!(
                 "Security violation: access to sensitive file '{}' is blocked by deny-list",
                 rel.display()
@@ -146,24 +148,25 @@ pub fn validate_path(
         }
     } else {
         for src in &canon_sources {
-            if let Ok(rel) = resolved.strip_prefix(src) {
-                if is_denied_path(rel) {
-                    bail!(
-                        "Security violation: access to sensitive file '{}' is blocked by deny-list",
-                        rel.display()
-                    );
-                }
+            if let Ok(rel) = resolved.strip_prefix(src)
+                && !rel.as_os_str().is_empty()
+                && is_denied_path(rel)
+            {
+                bail!(
+                    "Security violation: access to sensitive file '{}' is blocked by deny-list",
+                    rel.display()
+                );
             }
         }
     }
 
-    if let Some(fname) = resolved.file_name() {
-        if is_denied_path(Path::new(fname)) {
-            bail!(
-                "Security violation: access to sensitive file '{}' is blocked by deny-list",
-                resolved.display()
-            );
-        }
+    if let Some(fname) = resolved.file_name()
+        && is_denied_path(Path::new(fname))
+    {
+        bail!(
+            "Security violation: access to sensitive file '{}' is blocked by deny-list",
+            resolved.display()
+        );
     }
 
     Ok(resolved)
@@ -213,8 +216,12 @@ pub fn validate_command(command: &str) -> Result<()> {
     Ok(())
 }
 
-/// Converts a validated path into a clean display key (relative to project_root if inside it, otherwise canonical path).
+/// Converts a path into a clean display key (relative to already-canonical `project_root` if inside it,
+/// otherwise canonical forward-slash path).
 pub fn to_index_path(project_root: &Path, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(project_root) {
+        return rel.to_string_lossy().replace('\\', "/");
+    }
     let canon_root = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let canon_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if let Ok(rel) = canon_path.strip_prefix(&canon_root) {
@@ -222,6 +229,24 @@ pub fn to_index_path(project_root: &Path, path: &Path) -> String {
     } else {
         canon_path.to_string_lossy().replace('\\', "/")
     }
+}
+
+/// Normalizes an absolute path to forward slashes for consistent cross-DB keys.
+pub fn normalize_abs_key(path: &Path) -> String {
+    let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canon.to_string_lossy().replace('\\', "/")
+}
+
+/// Escapes SQL `LIKE` wildcard characters (`\`, `%`, `_`) for use with `ESCAPE '\'`.
+pub fn escape_sql_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -272,9 +297,10 @@ mod tests {
     }
 
     #[test]
-    fn test_path_confinement_and_traversal() {
+    fn test_path_confinement_traversal_symlinks_and_ancestor_name() {
         let temp = std::env::temp_dir().join(format!("lee_sec_test_{}", std::process::id()));
-        let root = temp.join("workspace");
+        // Ancestor folder contains "secret" to verify it does not false-trigger deny-list on valid files inside
+        let root = temp.join("secret-workspace");
         let outside = temp.join("outside");
         let ext_source = temp.join("ext_docs");
         let _ = fs::remove_dir_all(&temp);
@@ -293,9 +319,10 @@ mod tests {
 
         let sources = vec![ext_source.clone()];
 
-        // Valid relative & absolute inside root
+        // Valid relative & absolute inside root (even though ancestor has "secret")
         assert!(validate_path(&root, &sources, Path::new("main.rs")).is_ok());
         assert!(validate_path(&root, &sources, &valid_file).is_ok());
+        assert!(!is_denied_relative_to(&root, &valid_file));
 
         // Valid inside registered external source
         assert!(validate_path(&root, &sources, &ext_doc).is_ok());
@@ -308,12 +335,24 @@ mod tests {
         assert!(validate_path(&root, &sources, Path::new(".env")).is_err());
         assert!(validate_path(&root, &sources, &env_file).is_err());
 
+        // Blocked nested non-existent path through symlink escaping workspace
+        #[cfg(unix)]
+        {
+            let link = root.join("escape_link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(
+                validate_path(&root, &sources, Path::new("escape_link/nonexistent/deep.rs"))
+                    .is_err()
+            );
+        }
+
         let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]
     fn test_command_validation() {
         assert!(validate_command("cargo test --quiet").is_ok());
+        assert!(validate_command("   ").is_err());
         assert!(validate_command("cat .env").is_err());
         assert!(validate_command("grep API_KEY config/.env.local").is_err());
         assert!(validate_command("cat ~/.ssh/id_rsa").is_err());

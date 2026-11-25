@@ -1,10 +1,5 @@
+use crate::digest::{format_exit_status, ParsedDigest};
 use std::collections::BTreeMap;
-
-#[derive(Debug, Clone)]
-pub struct ParsedDigest {
-    pub summary_lines: Vec<String>,
-    pub failure_blocks: Vec<String>,
-}
 
 pub fn is_cargo_command(cmd: &str) -> bool {
     let trimmed = cmd.trim();
@@ -28,7 +23,7 @@ fn extract_lint_rule(block_lines: &[&str], header_line: &str) -> Option<String> 
             return Some(code.to_string());
         }
     }
-    // Check `= note: #[warn(clippy::...)]` or `#[deny(...)]` inside block
+    // Check `= note: #[warn(clippy::...)]` / `#[deny(...)]` or `= help: for further information visit ...#lint`
     for l in block_lines {
         for marker in ["#[warn(", "#[deny(", "#[forbid("] {
             if let Some(pos) = l.find(marker) {
@@ -39,6 +34,22 @@ fn extract_lint_rule(block_lines: &[&str], header_line: &str) -> Option<String> 
                         return Some(rule.to_string());
                     }
                 }
+            }
+        }
+        if l.contains("for further information visit")
+            && let Some(hash_pos) = l.rfind('#')
+        {
+            let rule = l[hash_pos + 1..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != ':');
+            if !rule.is_empty() {
+                return Some(if rule.contains("::") {
+                    rule.to_string()
+                } else {
+                    format!("clippy::{rule}")
+                });
             }
         }
     }
@@ -55,14 +66,11 @@ fn extract_location(block_lines: &[&str]) -> Option<String> {
     None
 }
 
-pub fn parse_cargo_output(raw: &str, exit_code: Option<i32>) -> ParsedDigest {
-    parse_cargo_output_with_cmd("cargo", raw, exit_code)
-}
-
 pub fn parse_cargo_output_with_cmd(cmd: &str, raw: &str, exit_code: Option<i32>) -> ParsedDigest {
     let lines: Vec<&str> = raw.lines().collect();
     let mut summary_lines = Vec::new();
-    let mut failure_blocks = Vec::new();
+    let mut error_blocks = Vec::new();
+    let mut warning_blocks = Vec::new();
     let mut compiled_crates = 0usize;
     let mut warnings = 0usize;
     let keep_stdout = has_verbose_test_flag(cmd);
@@ -98,13 +106,22 @@ pub fn parse_cargo_output_with_cmd(cmd: &str, raw: &str, exit_code: Option<i32>)
             if is_warning {
                 warnings += 1;
             }
-            let block_end = (i + 14).min(lines.len());
+            let block_end = (i + 24).min(lines.len());
             let mut block = Vec::new();
             let mut raw_slice = Vec::new();
             for (idx, l) in lines[i..block_end].iter().enumerate() {
+                let lt = l.trim();
+                if idx > 0
+                    && is_stdout_header
+                    && ((lt.starts_with("---- ") && lt.ends_with(" stdout ----"))
+                        || lt.starts_with("failures:")
+                        || lt.starts_with("test result:"))
+                {
+                    break;
+                }
                 block.push(format!("{:>4} | {l}", i + idx + 1));
                 raw_slice.push(*l);
-                if idx > 0 && l.trim().is_empty() && !is_stdout_header {
+                if idx > 0 && lt.is_empty() && !is_stdout_header {
                     break;
                 }
             }
@@ -120,13 +137,15 @@ pub fn parse_cargo_output_with_cmd(cmd: &str, raw: &str, exit_code: Option<i32>)
 
             if is_stdout_header && keep_stdout {
                 summary_lines.push(block.join("\n"));
-            } else if is_error || failure_blocks.len() < 12 {
-                failure_blocks.push(block.join("\n"));
-                if is_error && summary_lines.len() < 20 {
+            } else if is_error {
+                error_blocks.push(block.join("\n"));
+                if summary_lines.len() < 20 {
                     summary_lines.push(format!("L{}: {}", i + 1, trimmed));
                 }
+            } else if warning_blocks.len() < 12 {
+                warning_blocks.push(block.join("\n"));
             }
-            i += block.len();
+            i += block.len().max(1);
             continue;
         }
 
@@ -139,6 +158,13 @@ pub fn parse_cargo_output_with_cmd(cmd: &str, raw: &str, exit_code: Option<i32>)
         }
 
         i += 1;
+    }
+
+    // Prioritize errors ahead of warnings so digest caps never hide compiler/test errors
+    let mut failure_blocks = error_blocks;
+    if failure_blocks.len() < 12 {
+        let remaining = 12 - failure_blocks.len();
+        failure_blocks.extend(warning_blocks.into_iter().take(remaining));
     }
 
     if !lint_groups.is_empty() {
@@ -172,7 +198,7 @@ pub fn parse_cargo_output_with_cmd(cmd: &str, raw: &str, exit_code: Option<i32>)
     if summary_lines.is_empty() {
         summary_lines.push(format!(
             "Cargo command completed (exit={}, total_lines={}).",
-            exit_code.unwrap_or(0),
+            format_exit_status(exit_code),
             lines.len()
         ));
     }

@@ -2,13 +2,8 @@
 name = "lee"
 version = "0.1.0"
 edition = "2024"
-default-run = "lee"
-description = "Locate Exact Elements — Local token-saving MCP server, AST code & Markdown indexer, output digest engine, and SQLite FTS5 memory store for AI coding agents."
+description = "Locate Exact Elements — Local token-saving MCP server, AST code & Markdown indexer, SQLite FTS5 docs search, and output digest engine for AI coding agents."
 license = "MIT"
-
-[[bin]]
-name = "lee"
-path = "src/main.rs"
 
 [dependencies]
 # CLI & Serialization

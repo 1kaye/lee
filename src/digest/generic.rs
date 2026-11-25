@@ -1,4 +1,4 @@
-use crate::digest::cargo::ParsedDigest;
+use crate::digest::{format_exit_status, ParsedDigest};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -12,13 +12,32 @@ fn err_regex() -> &'static Regex {
 
 pub fn is_diff_command(cmd: &str, raw: &str) -> bool {
     let c = cmd.trim();
-    c.contains("diff")
-        || c.contains("what change")
-        || c.contains("w c")
+    let cmd_is_diff = c == "git diff"
+        || c.starts_with("git diff ")
+        || c == "git show"
+        || c.starts_with("git show ")
+        || c == "kaye diff"
+        || c.starts_with("kaye diff ")
         || c == "kaye wc"
         || c.starts_with("kaye wc ")
+        || c == "kaye w c"
+        || c.starts_with("kaye w c ")
+        || c == "kaye what change"
+        || c.starts_with("kaye what change ")
+        || c == "gh pr diff"
+        || c.starts_with("gh pr diff ")
+        || c.starts_with("diff ");
+    if cmd_is_diff {
+        return true;
+    }
+    if crate::digest::cargo::is_cargo_command(c)
+        || crate::digest::node::is_node_command(c)
+        || crate::digest::python_go::is_python_or_go_command(c)
+    {
+        return false;
+    }
+    raw.starts_with("diff --git ")
         || raw.contains("\ndiff --git ")
-        || raw.starts_with("diff --git ")
         || raw.contains("\n  [MODIFIED] ")
         || raw.contains("\n  [NEW] ")
 }
@@ -52,6 +71,8 @@ pub fn parse_git_status_or_log_output(cmd: &str, raw: &str, exit_code: Option<i3
                 current_author.clear();
                 current_date.clear();
                 msg_collected = false;
+            } else if trimmed.starts_with("Merge:") {
+                continue;
             } else if let Some(auth) = trimmed.strip_prefix("Author:") {
                 current_author = auth
                     .split('<')
@@ -61,7 +82,7 @@ pub fn parse_git_status_or_log_output(cmd: &str, raw: &str, exit_code: Option<i3
                     .to_string();
             } else if let Some(dt) = trimmed.strip_prefix("Date:") {
                 current_date = dt.trim().chars().take(16).collect();
-            } else if !trimmed.is_empty() && ! current_sha.is_empty() && !msg_collected {
+            } else if !trimmed.is_empty() && !current_sha.is_empty() && !msg_collected {
                 summary_lines.push(format!(
                     "- {current_sha} ({current_author}, {current_date}): {trimmed}"
                 ));
@@ -84,10 +105,10 @@ pub fn parse_git_status_or_log_output(cmd: &str, raw: &str, exit_code: Option<i3
         }
     }
 
-    if summary_lines.is_empty() {
+    if summary_lines.is_empty() && !(raw.trim().is_empty() && exit_code == Some(0)) {
         summary_lines.push(format!(
             "VCS command finished (exit={}).",
-            exit_code.unwrap_or(0)
+            format_exit_status(exit_code)
         ));
     }
 
@@ -119,48 +140,45 @@ pub fn parse_diff_output(raw: &str, exit_code: Option<i32>) -> ParsedDigest {
     let failure_blocks = Vec::new();
 
     summary_lines.push(format!(
-        "Diff summary (exit_code={:?}, total_lines={}):",
-        exit_code,
+        "Diff summary (exit={}, total_lines={}):",
+        format_exit_status(exit_code),
         lines.len()
     ));
 
-    let mut current_file: Option<(String, usize, usize, usize)> = None; // (file, start_line, added, removed)
+    // (file, start_line, added, removed, is_kaye_indented)
+    let mut current_file: Option<(String, usize, usize, usize, bool)> = None;
 
     for (idx, line) in lines.iter().enumerate() {
         let ln = idx + 1;
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            if let Some((f, st, add, rem)) = current_file.take() {
+            if let Some((f, st, add, rem, _)) = current_file.take() {
                 summary_lines.push(format!(
                     "- {f} [L{st}..{}] (+{add} / -{rem}) -> recall with `item=\"{f}\"`",
                     ln.saturating_sub(1)
                 ));
             }
-            let file_name = rest
-                .split_whitespace()
-                .last()
-                .unwrap_or(rest)
-                .trim_start_matches("b/")
-                .to_string();
-            current_file = Some((file_name, ln, 0, 0));
+            let last_tok = rest.split_whitespace().last().unwrap_or(rest);
+            let file_name = last_tok.strip_prefix("b/").unwrap_or(last_tok).to_string();
+            current_file = Some((file_name, ln, 0, 0, false));
         } else if let Some(kaye_path) = parse_kaye_wc_file_header(line) {
-            if let Some((f, st, add, rem)) = current_file.take() {
+            if let Some((f, st, add, rem, _)) = current_file.take() {
                 summary_lines.push(format!(
                     "- {f} [L{st}..{}] (+{add} / -{rem}) -> recall with `item=\"{f}\"`",
                     ln.saturating_sub(1)
                 ));
             }
-            current_file = Some((kaye_path.to_string(), ln, 0, 0));
-        } else if let Some((_, _, ref mut add, ref mut rem)) = current_file {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+            current_file = Some((kaye_path.to_string(), ln, 0, 0, true));
+        } else if let Some((_, _, ref mut add, ref mut rem, is_kaye)) = current_file {
+            let check = if is_kaye { line.trim_start() } else { *line };
+            if check.starts_with('+') && !check.starts_with("+++") {
                 *add += 1;
-            } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+            } else if check.starts_with('-') && !check.starts_with("---") {
                 *rem += 1;
             }
         }
     }
 
-    if let Some((f, st, add, rem)) = current_file.take() {
+    if let Some((f, st, add, rem, _)) = current_file.take() {
         summary_lines.push(format!(
             "- {f} [L{st}..{}] (+{add} / -{rem}) -> recall with `item=\"{f}\"`",
             lines.len()
@@ -183,8 +201,8 @@ pub fn parse_generic_output(raw: &str, exit_code: Option<i32>) -> ParsedDigest {
     let mut failure_blocks = Vec::new();
 
     summary_lines.push(format!(
-        "Command finished (exit_code={:?}, total_lines={total}).",
-        exit_code
+        "Command finished (exit={}, total_lines={total}).",
+        format_exit_status(exit_code)
     ));
 
     // First 10 lines
